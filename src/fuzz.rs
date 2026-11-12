@@ -504,4 +504,12 @@ mod tests {
         let seeds = ["65000.0,0.1", "0.0030,0.0001", "120,10", "0,1"].map(str::to_string);
         hammer(wire_format, &seeds);
     }
+
+    /// The input of the first crash that the CI fuzz job found (12 Nov 2026).
+    #[test]
+    fn wire_format_survives_a_step_of_23_decimals() {
+        wire_format(&[
+            80, 50, 29, 6, 0, 0, 0, 0, 0, 0, 80, 0, 0, 0, 0, 0, 0, 53, 0, 0, 44,
+        ]);
+    }
 }

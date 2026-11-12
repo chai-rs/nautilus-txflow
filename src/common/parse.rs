@@ -40,7 +40,8 @@ pub const fn millis_to_nanos(millis: u64) -> UnixNanos {
 ///
 /// # Errors
 ///
-/// Returns an error if `step` is not positive or `value` is negative or off the step.
+/// Returns an error if `step` is not positive, `value` is negative or off the step, or
+/// `value` with the decimals of `step` has more than 28 significant digits.
 pub fn wire_decimal(value: Decimal, step: Decimal) -> anyhow::Result<String> {
     anyhow::ensure!(step > Decimal::ZERO, "step must be positive, was {step}");
     anyhow::ensure!(
@@ -51,8 +52,16 @@ pub fn wire_decimal(value: Decimal, step: Decimal) -> anyhow::Result<String> {
         .checked_rem(step)
         .ok_or_else(|| anyhow::anyhow!("{value} cannot be checked against step {step}"))?;
     anyhow::ensure!(remainder.is_zero(), "{value} is not a multiple of {step}");
-    let scale = step.normalize().scale() as usize;
-    Ok(format!("{value:.scale$}"))
+    let scale = step.normalize().scale();
+    // Not `format!("{value:.scale$}")`: `rust_decimal` panics if that text is longer than 32
+    // characters.
+    let mut wire = value;
+    wire.rescale(scale);
+    anyhow::ensure!(
+        wire.scale() == scale,
+        "{value} does not fit {scale} decimals"
+    );
+    Ok(wire.to_string())
 }
 
 #[derive(Deserialize)]
@@ -138,6 +147,9 @@ mod tests {
     #[case(dec!(50000.15), dec!(0.1), None)]
     #[case(dec!(-1), dec!(0.1), None)]
     #[case(dec!(1), dec!(0), None)]
+    #[case(dec!(1.2000), dec!(0.01), Some("1.20"))]
+    #[case(dec!(0), dec!(0.0001), Some("0.0000"))]
+    #[case(dec!(102576720), dec!(0.00000000000000000002048), None)]
     fn wire_decimal_enforces_the_step(
         #[case] value: Decimal,
         #[case] step: Decimal,
