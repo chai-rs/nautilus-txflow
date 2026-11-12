@@ -1,0 +1,52 @@
+[package]
+name = "nautilus-txflow-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "LGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the parent package: `cargo fuzz` needs its own workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+nautilus-txflow = { path = ".." }
+
+[[bin]]
+name = "http_parse"
+path = "fuzz_targets/http_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_parse"
+path = "fuzz_targets/ws_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "book_apply"
+path = "fuzz_targets/book_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "action_sign"
+path = "fuzz_targets/action_sign.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_format"
+path = "fuzz_targets/wire_format.rs"
+test = false
+doc = false
+bench = false
+

@@ -1,0 +1,58 @@
+{
+  "success": true,
+  "code": 0,
+  "data": {
+    "accountValuePlusWithdrawHold": "1250.50",
+    "activeReverseJobs": [],
+    "assetPositions": [
+      {
+        "position": {
+          "adlQuantile": 0,
+          "asset": "1",
+          "coin": "1",
+          "cumFunding": {
+            "allTime": "0.12",
+            "sinceChange": "0.01",
+            "sinceOpen": "0.12"
+          },
+          "entryPx": "64990.5",
+          "leverage": {
+            "rawUsd": "-175.47",
+            "type": "Cross",
+            "value": 10
+          },
+          "liquidationPx": "0",
+          "marginRatio": "0.01",
+          "marginUsed": "19.50",
+          "markPx": "65010.0",
+          "maxLeverage": 75,
+          "positionValue": "195.03",
+          "returnOnEquity": "0.003",
+          "szi": "0.0030",
+          "unrealizedPnl": "0.0585",
+          "updateTime": 1791890005000
+        },
+        "tpsl": [],
+        "type": "oneWay"
+      }
+    ],
+    "crossMaintenanceMarginUsed": "9.75",
+    "crossMarginRatio": "0.0078",
+    "crossMarginSummary": {
+      "accountValue": "1250.50",
+      "totalMarginUsed": "19.50",
+      "totalNtlPos": "195.03",
+      "totalRawUsd": "1055.47"
+    },
+    "marginSummary": {
+      "accountValue": "1250.50",
+      "totalMarginUsed": "19.50",
+      "totalNtlPos": "195.03",
+      "totalRawUsd": "1055.47"
+    },
+    "time": 1791893600000,
+    "totalRawUsdPlusWithdrawHold": "1055.47",
+    "vaultEquity": "0",
+    "withdrawable": "1231.00"
+  }
+}

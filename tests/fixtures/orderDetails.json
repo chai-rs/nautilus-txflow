@@ -1,0 +1,49 @@
+{
+  "success": true,
+  "code": 0,
+  "data": {
+    "type": "orderDetails",
+    "orderDetails": {
+      "order": {
+        "coin": "BTC",
+        "symbol": "BTC-USDC",
+        "side": "B",
+        "limitPx": "65000.0",
+        "sz": "0.0030",
+        "oid": 211558900001,
+        "timestamp": 1791890000000,
+        "triggerCondition": "",
+        "isTrigger": false,
+        "triggerPx": "0",
+        "children": [
+          ""
+        ],
+        "isPositionTpsl": false,
+        "reduceOnly": false,
+        "dir": "Open Long",
+        "orderType": "Limit",
+        "origSz": "0.0030",
+        "tif": "Gtc",
+        "cloid": "hist-filled-1",
+        "avgFillPrice": "64990.5",
+        "positionMode": "OneWay",
+        "marginMode": "cross",
+        "leverage": 10,
+        "pnl": "0",
+        "entryPrice": "0",
+        "roe": "0",
+        "fee": "0.0585",
+        "filledAmount": "0.0030",
+        "cancelSource": "",
+        "status": "filled",
+        "instrumentId": 1,
+        "instrumentType": "perps",
+        "marketType": "perps",
+        "builder": "",
+        "builderFeeRate": "0"
+      },
+      "status": "filled",
+      "statusTimestamp": 1791890005000
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "success": true,
+  "code": 0,
+  "data": [
+    {
+      "asset": 1,
+      "cloid": "my-order-001",
+      "coin": "BTC-USDC",
+      "dir": "Buy",
+      "filledAmount": "0",
+      "instrumentType": "Perps",
+      "isPositionTpsl": false,
+      "isTrigger": false,
+      "leverage": 10,
+      "limitPx": "66539.0",
+      "marginMode": "Cross",
+      "oid": 211558907950,
+      "orderType": "Limit",
+      "origSz": "0.0010",
+      "positionMode": "OneWay",
+      "reduceOnly": false,
+      "side": "B",
+      "state": "Open",
+      "sz": "0.0010",
+      "tif": "GTC",
+      "timestamp": 1791893561993,
+      "triggerCondition": "",
+      "triggerPx": ""
+    }
+  ]
+}

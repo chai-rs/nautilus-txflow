@@ -1,0 +1,23 @@
+{
+  "success": true,
+  "code": 0,
+  "data": [
+    {
+      "asset": "1",
+      "cloid": "stop-001",
+      "coin": "1",
+      "createTime": 1791893600000,
+      "leverage": 10,
+      "limitPx": "0",
+      "marginMode": "Cross",
+      "oid": 211558908001,
+      "orderType": "market",
+      "positionMode": "OneWay",
+      "reduceOnly": true,
+      "side": "A",
+      "sz": "0.0030",
+      "triggerPx": "60000.0",
+      "triggerState": ""
+    }
+  ]
+}
