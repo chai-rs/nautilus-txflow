@@ -18,6 +18,7 @@ use nautilus_txflow::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let aero = InstrumentId::from("AERO-USDC-PERP.TXFLOW");
     let eth = InstrumentId::from("ETH-USDC-PERP.TXFLOW");
     let btc = InstrumentId::from("BTC-USDC-PERP.TXFLOW");
     let bar_types = vec![BarType::new(
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tester_config = DataTesterConfig::builder()
         .client_id(ClientId::new(TXFLOW))
-        .instrument_ids(vec![btc, eth])
+        .instrument_ids(vec![aero, btc, eth])
         .bar_types(bar_types)
         .subscribe_book_deltas(true)
         .manage_book(true)
@@ -54,6 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe_index_prices(true)
         .subscribe_funding_rates(true)
         .subscribe_bars(true)
+        .subscribe_book_depth(true)
+        .subscribe_instrument_status(true)
         // .request_instruments(true)
         // .request_trades(true)
         // .request_bars(true)

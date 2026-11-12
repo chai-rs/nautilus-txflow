@@ -18,12 +18,14 @@ impl TxflowDataClientConfig {
         base_url_http = None,
         proxy_url = None,
         http_timeout_secs = None,
+        instrument_status_poll_secs = None,
     ))]
     fn py_new(
         environment: Option<TxflowEnvironment>,
         base_url_http: Option<String>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
+        instrument_status_poll_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -31,6 +33,8 @@ impl TxflowDataClientConfig {
             base_url_http,
             proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            instrument_status_poll_secs: instrument_status_poll_secs
+                .unwrap_or(defaults.instrument_status_poll_secs),
         }
     }
 
@@ -47,6 +51,11 @@ impl TxflowDataClientConfig {
     #[getter]
     fn http_timeout_secs(&self) -> u64 {
         self.http_timeout_secs
+    }
+
+    #[getter]
+    fn instrument_status_poll_secs(&self) -> u64 {
+        self.instrument_status_poll_secs
     }
 
     fn __repr__(&self) -> String {

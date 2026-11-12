@@ -31,6 +31,7 @@ use nautilus_common::{
         execution::{
             CancelAllOrders, CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
             GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, SubmitOrder,
+            SubmitOrderList,
         },
     },
 };
@@ -43,8 +44,8 @@ use nautilus_model::{
         TimeInForce, TriggerType,
     },
     events::OrderEventAny,
-    identifiers::{ClientId, ClientOrderId, InstrumentId, TraderId, VenueOrderId},
-    orders::{Order, OrderAny, OrderTestBuilder},
+    identifiers::{ClientId, ClientOrderId, InstrumentId, OrderListId, TraderId, VenueOrderId},
+    orders::{Order, OrderAny, OrderList, OrderTestBuilder},
     types::{Money, Price, Quantity},
 };
 use nautilus_txflow::{
@@ -59,6 +60,7 @@ use nautilus_txflow::{
         action::{
             Action, CancelAction, CancelBody, CancelByCloidAction, CancelByCloidBody, Grouping,
             ModifyAction, ModifyBody, OrderAction, OrderBody, OrderKind, Tif, UpdateLeverage,
+            UpdateMarginMode,
         },
     },
 };
@@ -354,6 +356,39 @@ impl Harness {
             UnixNanos::default(),
         );
         self.client.submit_order(cmd).unwrap();
+    }
+
+    fn submit_list(&self, orders: &[OrderAny]) {
+        for order in orders {
+            self.cache
+                .borrow_mut()
+                .add_order(order.clone(), None, Some(client_id()), false)
+                .unwrap();
+        }
+        let list = OrderList::new(
+            OrderListId::from("OL-1"),
+            btc(),
+            orders[0].strategy_id(),
+            orders.iter().map(Order::client_order_id).collect(),
+            UnixNanos::default(),
+        );
+        let cmd = SubmitOrderList::new(
+            trader_id(),
+            Some(client_id()),
+            orders[0].strategy_id(),
+            list,
+            orders
+                .iter()
+                .map(|order| order.init_event().clone())
+                .collect(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        self.client.submit_order_list(cmd).unwrap();
     }
 
     /// The next event, which must be an order event. It is applied to the cached order, so an
@@ -988,4 +1023,238 @@ async fn reconnect_resubscribes_and_catches_up_from_the_history() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0]["user"], USER);
     assert!(history[0]["startTimeMs"].as_u64().is_some());
+}
+
+/// A trigger order that closes the order made with [`limit`]`("O-1")`.
+fn child(order_type: OrderType, client_order_id: &str, trigger_price: &str) -> OrderAny {
+    OrderTestBuilder::new(order_type)
+        .instrument_id(btc())
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("0.0030"))
+        .trigger_price(Price::from(trigger_price))
+        .trigger_type(TriggerType::MarkPrice)
+        .reduce_only(true)
+        .parent_order_id(ClientOrderId::from("O-1"))
+        .build()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn order_list_with_tp_and_sl_is_one_tpsl_action() {
+    let mut h = Harness::connect().await;
+    // Hand-made in the documented shape of `tpslOrders`: one row for the pair
+    h.venue.state.lock().overrides.insert(
+        "tpslOrders".to_string(),
+        json!({"success": true, "code": 0, "data": [{
+            "asset": "1", "cloid": "", "coin": "1", "createTime": 1_791_893_600_000_u64,
+            "leverage": 10, "marginMode": "Cross", "positionMode": "OneWay",
+            "quantity": "0.0030", "reduceOnly": true, "side": "A",
+            "slOid": "501", "slOrderPrice": "0", "slOrderType": "Market",
+            "slTriggerPrice": "60000.0",
+            "tpOid": "502", "tpOrderPrice": "0", "tpOrderType": "Market",
+            "tpTriggerPrice": "70000.0",
+        }]}),
+    );
+    let stop = child(OrderType::StopMarket, "sl-1", "60000.0");
+    let take = child(OrderType::MarketIfTouched, "tp-1", "70000.0");
+    h.submit_list(&[limit("O-1").build(), stop.clone(), take]);
+    for _ in 0..3 {
+        assert!(matches!(h.order_event().await, OrderEventAny::Submitted(_)));
+    }
+
+    // One signed action for the three orders, the parent first
+    let posts = h.venue.wait_exchange_posts(1).await;
+    let action = &posts[0]["action"];
+    assert_eq!(action["grouping"], "normalTpsl");
+    let sent = action["orders"].as_array().unwrap();
+    assert_eq!(
+        sent.iter().map(|order| &order["c"]).collect::<Vec<_>>(),
+        ["O-1", "sl-1", "tp-1"]
+    );
+    assert_eq!(sent[0]["t"], json!({"limit": {"tif": "Gtc"}}));
+    assert_eq!(
+        sent[1]["t"],
+        json!({"trigger": {"isMarket": true, "triggerPx": "60000.0", "tpsl": "sl"}})
+    );
+    assert_eq!(sent[2]["t"]["trigger"]["tpsl"], "tp");
+    assert_eq!(
+        (&sent[1]["b"], &sent[1]["r"]),
+        (&json!(false), &json!(true))
+    );
+
+    // The children get the order ids of the pair, matched on the trigger price
+    for oid in ["501", "502"] {
+        let OrderEventAny::Accepted(accepted) = h.order_event().await else {
+            panic!("expected OrderAccepted");
+        };
+        assert_eq!(accepted.venue_order_id, VenueOrderId::new(oid));
+    }
+
+    // The pair is in the open order reports, each leg once
+    let open = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let open = h.client.generate_order_status_reports(&open).await.unwrap();
+    let legs: Vec<_> = open
+        .iter()
+        .filter(|report| ["501", "502"].contains(&report.venue_order_id.as_str()))
+        .collect();
+    assert_eq!(legs.len(), 2);
+    assert_eq!(legs[0].trigger_price, Some(Price::from("60000.0")));
+    assert_eq!(legs[0].order_side, Some(OrderSide::Sell));
+    assert!(legs[0].reduce_only);
+
+    // A child is cancelled in its own family, and the answer closes it
+    h.cancel(&stop);
+    let posts = h.venue.wait_exchange_posts(2).await;
+    assert_eq!(
+        posts[1]["action"],
+        json!({"type": "cancel", "cancels": [{"a": 1, "o": 501, "grouping": "tpsl"}]})
+    );
+    assert!(matches!(h.order_event().await, OrderEventAny::Canceled(_)));
+
+    // A refusal of `tpslOrders` leaves the pairs out and keeps the other reports
+    h.venue.state.lock().overrides.insert(
+        "tpslOrders".to_string(),
+        json!({"success": false, "code": 10000, "message": "unknown type"}),
+    );
+    let open = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let open = h.client.generate_order_status_reports(&open).await.unwrap();
+    assert_eq!(open.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn order_list_of_another_shape_is_sent_without_a_link() {
+    let mut h = Harness::connect().await;
+    // The default bracket: the take-profit is a plain limit order, not a venue TP/SL child
+    let take = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(btc())
+        .client_order_id(ClientOrderId::from("tp-1"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("0.0030"))
+        .price(Price::from("70000.0"))
+        .parent_order_id(ClientOrderId::from("O-1"))
+        .build();
+    let stop = child(OrderType::StopMarket, "sl-1", "60000.0");
+    h.submit_list(&[limit("O-1").build(), stop, take]);
+    for _ in 0..3 {
+        assert!(matches!(h.order_event().await, OrderEventAny::Submitted(_)));
+    }
+
+    let posts = h.venue.wait_exchange_posts(2).await;
+    assert_eq!(posts[0]["action"]["grouping"], "na");
+    assert_eq!(posts[0]["action"]["orders"].as_array().unwrap().len(), 2);
+    assert_eq!(posts[1]["action"]["grouping"], "normalTrigger");
+    assert_eq!(posts[1]["action"]["orders"][0]["c"], "sl-1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leverage_and_margin_mode_change_at_run_time() {
+    let mut h = Harness::connect().await;
+
+    h.client
+        .update_leverage(btc(), 5, Some(TxflowMarginMode::Isolated))
+        .unwrap();
+    let posts = h.venue.wait_exchange_posts(1).await;
+    let leverage = Action::UpdateLeverage(UpdateLeverage {
+        asset: 1,
+        leverage: 5,
+        margin_mode: Some(TxflowMarginMode::Isolated),
+    });
+    h.assert_signed(&posts[0], &leverage);
+
+    h.client
+        .update_margin_mode(btc(), TxflowMarginMode::Isolated)
+        .unwrap();
+    let posts = h.venue.wait_exchange_posts(2).await;
+    let mode = Action::UpdateMarginMode(UpdateMarginMode {
+        asset: 1,
+        is_cross: false,
+    });
+    h.assert_signed(&posts[1], &mode);
+    assert_eq!(
+        posts[1]["action"],
+        json!({"type": "updateMarginMode", "asset": 1, "isCross": false})
+    );
+
+    // Once the venue confirmed, the orders of the market name the new mode. The answer is
+    // read in the background: give it time.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.submit(&limit("O-1").build());
+    assert!(matches!(h.order_event().await, OrderEventAny::Submitted(_)));
+    let posts = h.venue.wait_exchange_posts(3).await;
+    assert_eq!(posts[2]["action"]["orders"][0]["m"], "isolated");
+
+    // A refusal changes nothing; an unknown market or zero leverage is an error at once
+    h.venue
+        .reply(json!({"status": "err", "code": 10000, "message": "Cannot update leverage while you have open orders"}));
+    h.client
+        .update_margin_mode(btc(), TxflowMarginMode::Cross)
+        .unwrap();
+    h.venue.wait_exchange_posts(4).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.submit(&limit("O-2").build());
+    assert!(matches!(h.order_event().await, OrderEventAny::Submitted(_)));
+    let posts = h.venue.wait_exchange_posts(5).await;
+    assert_eq!(posts[4]["action"]["orders"][0]["m"], "isolated");
+
+    assert!(h.client.update_leverage(btc(), 0, None).is_err());
+    let unknown = InstrumentId::from("NOPE-USDC-PERP.TXFLOW");
+    assert!(h.client.update_leverage(unknown, 5, None).is_err());
+    assert_eq!(h.venue.exchange_posts().len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clearinghouse_frames_become_position_reports_once_per_change() {
+    let mut h = Harness::connect().await;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/clearinghouseState.json"
+    );
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let frame = json!({"channel": "clearinghouseState", "data": state["data"]});
+    let mut flat = frame.clone();
+    flat["data"]["assetPositions"] = json!([]);
+
+    // The same position twice, then none: the venue lists open positions only
+    for frame in [&frame, &frame, &flat] {
+        h.venue.push(frame);
+    }
+    let mut seen = Vec::new();
+    while seen.len() < 5 {
+        seen.push(match next_event(&mut h.events).await {
+            ExecutionEvent::Account(_) => "account".to_string(),
+            ExecutionEvent::Report(ExecutionReport::Position(report)) => {
+                assert_eq!(report.instrument_id, btc());
+                format!("{} {}", report.position_side, report.quantity)
+            }
+            other => panic!("unexpected event {other:?}"),
+        });
+    }
+    assert_eq!(
+        seen,
+        [
+            "account",
+            "LONG 0.0030",
+            "account",
+            "account",
+            "FLAT 0.0000"
+        ]
+    );
 }

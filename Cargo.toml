@@ -70,11 +70,28 @@ zeroize = "1.9.1"
 
 [dev-dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "query", "ws"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 dotenvy = "0.15.7"
 nautilus-live = { version = "=0.67.0", default-features = false, features = ["test-support"] }
 rstest = "0.28.0"
 rust_decimal_macros = "1.40.0"
 nautilus-testkit = { version = "=0.67.0", default-features = false, features = ["testers"] }
+
+# The binaries keep their unit tests (`cargo test` runs them), so no `test = false` here.
+[[bin]]
+name = "txflow-trades-probe"
+path = "bin/trades_probe.rs"
+doc = false
+
+[[bin]]
+name = "txflow-flatten"
+path = "bin/flatten.rs"
+doc = false
+
+[[bin]]
+name = "txflow-agent-revoke"
+path = "bin/agent_revoke.rs"
+doc = false
 
 [[example]]
 name = "data_tester"
@@ -87,3 +104,19 @@ name = "exec_tester"
 path = "examples/exec_tester.rs"
 doc = false
 required-features = ["examples"]
+
+[[bench]]
+name = "data"
+harness = false
+
+[[bench]]
+name = "exec"
+harness = false
+
+[[bench]]
+name = "micros"
+harness = false
+
+[[bench]]
+name = "signing"
+harness = false

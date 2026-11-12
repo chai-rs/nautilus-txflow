@@ -37,7 +37,7 @@ pub struct Bbo {
     pub bbo: (Option<Level>, Option<Level>),
 }
 
-/// `activeAssetCtx` frame.
+/// One market of an `allAssetCtxs` frame; also the whole `activeAssetCtx` frame.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActiveAssetCtx {
     #[serde(deserialize_with = "de_id")]
@@ -53,10 +53,15 @@ pub enum WsMessage {
     BookDepth(BookDepth),
     Bbo(Bbo),
     Trades(Vec<Trade>),
-    AssetCtx(ActiveAssetCtx),
+    AssetCtxs(Vec<ActiveAssetCtx>),
     Candle(Candle),
     OrderUpdates(Vec<OrderRow>),
     ClearinghouseState(Box<ClearinghouseState>),
+}
+
+#[derive(Deserialize)]
+struct AllAssetCtxs {
+    ctxs: Vec<ActiveAssetCtx>,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +95,8 @@ pub fn parse_frame(text: &str) -> serde_json::Result<Option<WsMessage>> {
         "l2BookDepth" => WsMessage::BookDepth(serde_json::from_str(data)?),
         "bbo" => WsMessage::Bbo(serde_json::from_str(data)?),
         "trades" => WsMessage::Trades(serde_json::from_str(data)?),
-        "activeAssetCtx" => WsMessage::AssetCtx(serde_json::from_str(data)?),
+        "activeAssetCtx" => WsMessage::AssetCtxs(vec![serde_json::from_str(data)?]),
+        "allAssetCtxs" => WsMessage::AssetCtxs(serde_json::from_str::<AllAssetCtxs>(data)?.ctxs),
         "candle" => WsMessage::Candle(serde_json::from_str(data)?),
         "orderUpdates" => WsMessage::OrderUpdates(serde_json::from_str(data)?),
         "clearinghouseState" => WsMessage::ClearinghouseState(serde_json::from_str(data)?),
@@ -136,11 +142,22 @@ mod tests {
         assert_eq!(bbo.bbo.0.unwrap().px, dec!(73381.2));
 
         let ctx = r#"{"channel":"activeAssetCtx","data":{"coin":"1","ctx":{"funding":"0.00078992","openInterest":"12.5","oraclePx":"73452.6","markPx":"73420.2","midPx":"73420.0","impactPxs":["1","2"],"lastPrice":"73418.6","nextFundingTime":1794337200000,"prevFundingTime":1794333600000,"blockTime":1794336500000}}}"#;
-        let Some(WsMessage::AssetCtx(ctx)) = parse_frame(ctx).unwrap() else {
+        let Some(WsMessage::AssetCtxs(ctxs)) = parse_frame(ctx).unwrap() else {
             panic!("expected activeAssetCtx");
         };
-        assert_eq!(ctx.ctx.mark_px, Some(dec!(73420.2)));
-        assert_eq!(ctx.ctx.next_funding_time, Some(1_794_337_200_000));
+        assert_eq!(ctxs[0].ctx.mark_px, Some(dec!(73420.2)));
+        assert_eq!(ctxs[0].ctx.next_funding_time, Some(1_794_337_200_000));
+
+        let all = include_str!("../../tests/fixtures/ws_frames.jsonl")
+            .lines()
+            .find(|line| line.contains("allAssetCtxs"))
+            .unwrap();
+        let Some(WsMessage::AssetCtxs(ctxs)) = parse_frame(all).unwrap() else {
+            panic!("expected allAssetCtxs");
+        };
+        let coins: Vec<_> = ctxs.iter().map(|ctx| ctx.coin.as_str()).collect();
+        assert_eq!(coins, ["1", "64"]);
+        assert_eq!(ctxs[1].ctx.mark_px, Some(dec!(0.5230)));
 
         let candle = r#"{"channel":"candle","data":{"t":1794336480000,"o":"73406.2","h":"73410.0","l":"73400.0","c":"73407.1","v":"0.4363","n":15,"s":"1","i":"1m","T":1794336539999}}"#;
         let Some(WsMessage::Candle(candle)) = parse_frame(candle).unwrap() else {

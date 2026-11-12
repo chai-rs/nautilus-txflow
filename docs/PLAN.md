@@ -22,6 +22,11 @@ Out (follow-ups, listed in `STATUS.md`): benches, CI workflow, flatten/revoke bi
 (prediction) markets, builder codes, deposits/withdrawals/transfers, vault trading, TWAP orders,
 position TP/SL groups (`normalTpsl`, `positionTpsl`, `modifyTpsl`), hedge position mode.
 
+Step E (12 Nov 2026) closed the gaps against `nautilus-lighter` 0.67.0 that the venue can
+serve: book depth, instrument status, live position reports, order lists with TP/SL children
+(`normalTpsl`), run-time leverage and margin mode. `STATUS.md` has the result of each item;
+the tables below describe steps A to D.
+
 ## Parity with the Hyperliquid adapter
 
 | Feature | Hyperliquid adapter | This adapter |

@@ -5,6 +5,7 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use nautilus_core::{AtomicTime, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, OrderBookDeltas, TradeTick},
+    enums::MarketStatusAction,
     identifiers::InstrumentId,
     instruments::InstrumentAny,
 };
@@ -35,9 +36,12 @@ use crate::{
         error::{TxflowHttpError, TxflowHttpResult, should_retry},
         models::{
             Candle, ClearinghouseState, ExchangeResponse, InfoEnvelope, L2Book, MarketTicker,
-            OrderDetails, OrderRow, Paged, Trade, TxflowOrder, Universe, UserFill,
+            OrderDetails, OrderRow, Paged, TpslPair, Trade, TxflowOrder, Universe, UserFill,
         },
-        parse::{parse_bar, parse_instrument, parse_ticker_funding, parse_trade_tick},
+        parse::{
+            instrument_id_from_name, market_status, parse_bar, parse_instrument,
+            parse_ticker_funding, parse_trade_tick,
+        },
     },
 };
 
@@ -280,6 +284,24 @@ impl TxflowHttpClient {
         Ok(instruments)
     }
 
+    /// Trading status of every market in the instrument cache, from the `haltTrading` and
+    /// `delisted` flags of `perpMeta`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_instrument_statuses(
+        &self,
+    ) -> TxflowHttpResult<Vec<(InstrumentId, MarketStatusAction)>> {
+        let meta: Universe = self.info(&json!({"type": "perpMeta"})).await?;
+        Ok(meta
+            .universe
+            .iter()
+            .map(|market| (instrument_id_from_name(&market.name), market_status(market)))
+            .filter(|(id, _)| self.instruments.get(id).is_some())
+            .collect())
+    }
+
     /// Book snapshot of 20 levels per side, as deltas that replace the book.
     ///
     /// # Errors
@@ -447,6 +469,28 @@ impl TxflowHttpClient {
                 Err(e) => {
                     log::warn!("Skipping a trigger order that cannot be decoded: {e}");
                     None
+                }
+            })
+            .collect())
+    }
+
+    /// Pending take-profit and stop-loss orders of `user`, each leg of a pair as one order.
+    /// A pair that cannot be decoded is logged and skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_tpsl_orders(&self, user: &str) -> TxflowHttpResult<Vec<TxflowOrder>> {
+        let rows: Vec<Value> = self
+            .info(&json!({"type": "tpslOrders", "user": user}))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .flat_map(|row| match serde_json::from_value::<TpslPair>(row) {
+                Ok(pair) => pair.legs(),
+                Err(e) => {
+                    log::warn!("Skipping a TP/SL pair that cannot be decoded: {e}");
+                    Vec::new()
                 }
             })
             .collect())

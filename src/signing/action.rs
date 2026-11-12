@@ -52,6 +52,8 @@ pub struct OrderAction {
 pub enum Grouping {
     Na,
     NormalTrigger,
+    /// A parent order followed by its take-profit and stop-loss children.
+    NormalTpsl,
 }
 
 /// One order of an `order` action.
@@ -117,6 +119,8 @@ pub enum Tpsl {
 #[serde(rename_all = "lowercase")]
 pub enum CancelGrouping {
     Trigger,
+    /// Take-profit and stop-loss children of a `normalTpsl` action.
+    Tpsl,
 }
 
 /// `cancel`: up to 200 cancels by order id.
@@ -245,6 +249,14 @@ pub(crate) mod tests {
     #[case(
         Action::Cancel(CancelAction { cancels: vec![CancelBody { a: 1, o: 7, grouping: Some(CancelGrouping::Trigger) }] }),
         json!({"type":"cancel","cancels":[{"a":1,"o":7,"grouping":"trigger"}]})
+    )]
+    #[case(
+        Action::Cancel(CancelAction { cancels: vec![CancelBody { a: 1, o: 7, grouping: Some(CancelGrouping::Tpsl) }] }),
+        json!({"type":"cancel","cancels":[{"a":1,"o":7,"grouping":"tpsl"}]})
+    )]
+    #[case(
+        Action::Order(OrderAction { grouping: Grouping::NormalTpsl, orders: vec![] }),
+        json!({"type":"order","grouping":"normalTpsl","orders":[]})
     )]
     #[case(
         Action::CancelByCloid(CancelByCloidAction { cancels: vec![CancelByCloidBody { asset: 1, cloid: "my-order-001".to_owned(), grouping: None }] }),

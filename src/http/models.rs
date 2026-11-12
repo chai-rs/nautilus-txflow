@@ -59,6 +59,9 @@ pub struct PerpMeta {
 pub struct Level {
     pub px: Decimal,
     pub sz: Decimal,
+    /// Number of orders at the price.
+    #[serde(default)]
+    pub n: u32,
 }
 
 /// `[bids, asks]`.
@@ -139,7 +142,7 @@ pub struct MarketTicker {
 
 /// An order as sent by `frontendOpenOrders`, `historicalOrders`, `orderDetails` and the
 /// `orderUpdates` channel. The four sources use different subsets of these fields.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TxflowOrder {
     #[serde(deserialize_with = "de_u64")]
@@ -245,6 +248,81 @@ pub struct OrderDetails {
     pub order_details: OrderRow,
 }
 
+/// Row of `/info tpslOrders`: one take-profit and stop-loss pair.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TpslPair {
+    pub coin: String,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    pub asset: Option<u64>,
+    /// unverified: read as the side of both orders (they close the position), as in the
+    /// example of `historicalTpslOrders`. The docs do not say.
+    pub side: String,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub quantity: Option<Decimal>,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    pub create_time: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    pub sl_oid: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub sl_order_price: Option<Decimal>,
+    #[serde(default)]
+    pub sl_order_type: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub sl_trigger_price: Option<Decimal>,
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    pub tp_oid: Option<u64>,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub tp_order_price: Option<Decimal>,
+    #[serde(default)]
+    pub tp_order_type: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub tp_trigger_price: Option<Decimal>,
+}
+
+impl TpslPair {
+    /// The legs of the pair as trigger orders, stop-loss first. A leg without an order id
+    /// does not exist.
+    #[must_use]
+    pub fn legs(&self) -> Vec<TxflowOrder> {
+        let leg = |oid: Option<u64>, limit_px, order_type: &Option<String>, trigger_px| {
+            Some(TxflowOrder {
+                oid: oid.filter(|oid| *oid != 0)?,
+                coin: self.coin.clone(),
+                asset: self.asset,
+                side: self.side.clone(),
+                limit_px,
+                sz: self.quantity,
+                trigger_px,
+                is_trigger: true,
+                reduce_only: self.reduce_only,
+                order_type: order_type.clone(),
+                timestamp: self.create_time,
+                ..Default::default()
+            })
+        };
+        [
+            leg(
+                self.sl_oid,
+                self.sl_order_price,
+                &self.sl_order_type,
+                self.sl_trigger_price,
+            ),
+            leg(
+                self.tp_oid,
+                self.tp_order_price,
+                &self.tp_order_type,
+                self.tp_trigger_price,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
 /// Row of `/info userFills`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,7 +362,7 @@ pub struct MarginSummary {
     pub total_margin_used: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub coin: String,
@@ -295,6 +373,10 @@ pub struct Position {
     pub szi: Option<Decimal>,
     #[serde(default, deserialize_with = "de_opt_decimal")]
     pub entry_px: Option<Decimal>,
+    /// `{type, value, rawUsd}`. `type` is the margin mode, which is part of the position key.
+    /// Kept as sent: the docs list no values, and another shape must not fail the state.
+    #[serde(default)]
+    pub leverage: Value,
 }
 
 impl Position {
@@ -422,6 +504,27 @@ mod tests {
     fn exchange_response_reject_reason(#[case] json: &str, #[case] expected: Option<&str>) {
         let response: ExchangeResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.reject_reason().as_deref(), expected);
+    }
+
+    #[rstest]
+    fn tpsl_pair_becomes_one_order_per_leg() {
+        // Hand-made in the documented shape of `tpslOrders`; the take-profit leg is not set
+        let pair: TpslPair = serde_json::from_str(
+            r#"{"asset":"1","cloid":"","coin":"1","createTime":1791893600000,"leverage":10,
+                "marginMode":"Cross","positionMode":"OneWay","quantity":"0.0030",
+                "reduceOnly":true,"side":"A","slOid":"501","slOrderPrice":"0",
+                "slOrderType":"Market","slTriggerPrice":"60000.0","tpOid":"",
+                "tpOrderPrice":"0","tpOrderType":"","tpTriggerPrice":"0"}"#,
+        )
+        .unwrap();
+        let legs = pair.legs();
+        assert_eq!(legs.len(), 1);
+        let stop = &legs[0];
+        assert_eq!((stop.oid, stop.instrument_key().as_str()), (501, "1"));
+        assert_eq!(stop.trigger_px, Some(dec!(60000.0)));
+        assert_eq!(stop.quantity(), dec!(0.0030));
+        assert!(stop.is_trigger && stop.reduce_only);
+        assert_eq!(stop.order_type.as_deref(), Some("Market"));
     }
 
     #[rstest]

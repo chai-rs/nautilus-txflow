@@ -28,7 +28,8 @@ use crate::{
     http::{
         models::{
             Candle, ClearinghouseState, ExchangeResponse, InfoEnvelope, L2Book, MarketTicker,
-            OrderDetails, OrderRow, Paged, PerpMeta, Trade, TxflowOrder, Universe, UserFill,
+            OrderDetails, OrderRow, Paged, PerpMeta, TpslPair, Trade, TxflowOrder, Universe,
+            UserFill,
         },
         parse::{
             parse_account_balance, parse_bar, parse_fill_reports, parse_instrument,
@@ -131,6 +132,11 @@ pub fn http_parse(data: &[u8]) {
             let _ = parse_order_status_report(order, status, None, account(), &INSTRUMENT, TS);
         }
     }
+    if let Some(pairs) = payload::<Vec<TpslPair>>(data) {
+        for order in pairs.iter().flat_map(TpslPair::legs) {
+            let _ = parse_order_status_report(&order, "open", None, account(), &INSTRUMENT, TS);
+        }
+    }
     if let Some(page) = payload::<Paged<OrderRow>>(data) {
         page.data.iter().for_each(order_row);
     }
@@ -166,8 +172,10 @@ pub fn ws_parse(data: &[u8]) {
             let _ = parse_quote(&bbo, &INSTRUMENT, TS);
         }
         Ok(Some(WsMessage::Trades(rows))) => trades(&rows),
-        Ok(Some(WsMessage::AssetCtx(ctx))) => {
-            let _ = crate::http::parse::parse_asset_ctx(&ctx.ctx, &INSTRUMENT, TS);
+        Ok(Some(WsMessage::AssetCtxs(ctxs))) => {
+            for ctx in &ctxs {
+                let _ = crate::http::parse::parse_asset_ctx(&ctx.ctx, &INSTRUMENT, TS);
+            }
         }
         Ok(Some(WsMessage::Candle(candle))) => {
             let _ = parse_bar(&candle, bar_type(), &INSTRUMENT, TS);
@@ -184,6 +192,7 @@ pub fn book_apply(data: &[u8]) {
     for line in String::from_utf8_lossy(data).lines() {
         if let Ok(Some(WsMessage::BookDepth(frame))) = parse_frame(line) {
             let _ = book.apply(&frame, &INSTRUMENT, TS);
+            let _ = book.depth(&INSTRUMENT, frame.seq, TS, TS);
         }
     }
 }
@@ -262,14 +271,19 @@ fn order_body(input: &mut Input) -> OrderBody {
 }
 
 fn action(input: &mut Input) -> Action {
-    let grouping = |input: &mut Input| input.maybe(|_| CancelGrouping::Trigger);
+    let grouping = |input: &mut Input| {
+        input.maybe(|i| {
+            if i.flag() {
+                CancelGrouping::Trigger
+            } else {
+                CancelGrouping::Tpsl
+            }
+        })
+    };
     match input.byte() % 6 {
         0 => Action::Order(OrderAction {
-            grouping: if input.flag() {
-                Grouping::Na
-            } else {
-                Grouping::NormalTrigger
-            },
+            grouping: [Grouping::Na, Grouping::NormalTrigger, Grouping::NormalTpsl]
+                [usize::from(input.byte() % 3)],
             orders: (0..input.byte() % 4).map(|_| order_body(input)).collect(),
         }),
         1 => Action::Cancel(CancelAction {
@@ -449,6 +463,7 @@ mod tests {
             "marketTicker.json",
             "frontendOpenOrders.json",
             "triggerOrders.json",
+            "tpslOrders.json",
             "historicalOrders.json",
             "orderDetails.json",
             "userFills.json",

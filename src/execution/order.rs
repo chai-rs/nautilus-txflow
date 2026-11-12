@@ -167,6 +167,37 @@ pub fn order_body(
     Ok((grouping, body))
 }
 
+/// Whether an order list is a parent order with its take-profit and stop-loss: the shape the
+/// venue takes as one `normalTpsl` action. The parent is a market or limit order and comes
+/// first. Each other order is a trigger order that names it as parent and closes it: same
+/// market, opposite side, same quantity. At most one take-profit and one stop-loss.
+#[must_use]
+pub fn is_tpsl_group(orders: &[OrderAny]) -> bool {
+    let [parent, children @ ..] = orders else {
+        return false;
+    };
+    let kinds: Vec<_> = children
+        .iter()
+        .map(|child| match child.order_type() {
+            OrderType::StopMarket | OrderType::StopLimit => Some(Tpsl::Sl),
+            OrderType::MarketIfTouched | OrderType::LimitIfTouched => Some(Tpsl::Tp),
+            _ => None,
+        })
+        .collect();
+    matches!(parent.order_type(), OrderType::Market | OrderType::Limit)
+        && matches!(
+            kinds[..],
+            [Some(_)] | [Some(Tpsl::Tp), Some(Tpsl::Sl)] | [Some(Tpsl::Sl), Some(Tpsl::Tp)]
+        )
+        && orders.iter().all(|order| !order.is_closed())
+        && children.iter().all(|child| {
+            child.parent_order_id() == Some(parent.client_order_id())
+                && child.instrument_id() == parent.instrument_id()
+                && child.order_side() != parent.order_side()
+                && child.quantity() == parent.quantity()
+        })
+}
+
 /// What the venue said about one order of an `/exchange` action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -385,6 +416,57 @@ mod tests {
     fn unsupported_orders_are_refused(#[case] order: OrderAny, #[case] reason: &str) {
         let error = body(&order).unwrap_err().to_string();
         assert!(error.contains(reason), "{error}");
+    }
+
+    #[test]
+    fn tpsl_group_is_a_parent_with_its_closing_triggers() {
+        let parent = builder(OrderType::Limit)
+            .price(Price::from("50000"))
+            .build();
+        let child = |order_type, id: &str| {
+            let mut child = builder(order_type);
+            child
+                .client_order_id(ClientOrderId::from(id))
+                .side(OrderSide::Sell)
+                .trigger_price(Price::from("48000"))
+                .parent_order_id(ClientOrderId::from("O-1"));
+            child
+        };
+        let stop = child(OrderType::StopMarket, "O-2").build();
+        let take = child(OrderType::MarketIfTouched, "O-3").build();
+        let group = |orders: &[&OrderAny]| {
+            is_tpsl_group(
+                &orders
+                    .iter()
+                    .map(|order| (*order).clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert!(group(&[&parent, &stop, &take]));
+        assert!(group(&[&parent, &take]));
+        // No children, two stops, the parent not first
+        assert!(!group(&[&parent]));
+        assert!(!group(&[&parent, &stop, &stop]));
+        assert!(!group(&[&stop, &parent]));
+        // A plain limit take-profit (the default bracket) is not a venue TP/SL child
+        let limit_take = child(OrderType::Limit, "O-4")
+            .price(Price::from("52000"))
+            .build();
+        assert!(!group(&[&parent, &stop, &limit_take]));
+        // A child of another order, on the side of the parent, or of another size
+        let orphan = child(OrderType::StopMarket, "O-5")
+            .parent_order_id(ClientOrderId::from("O-9"))
+            .build();
+        let same_side = child(OrderType::StopMarket, "O-6")
+            .side(OrderSide::Buy)
+            .build();
+        let smaller = child(OrderType::StopMarket, "O-7")
+            .quantity(Quantity::from("0.005"))
+            .build();
+        for odd in [&orphan, &same_side, &smaller] {
+            assert!(!group(&[&parent, odd]));
+        }
     }
 
     fn response(value: serde_json::Value) -> TxflowHttpResult<ExchangeResponse> {

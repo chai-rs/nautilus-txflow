@@ -1,7 +1,8 @@
 //! Live market data client.
 //!
 //! The node stream (`/ws`) feeds books, quotes, trades, mark and index prices and funding
-//! rates. The API-service stream (`/api-ws`) feeds candles. Both need no credentials.
+//! rates. The API-service stream (`/api-ws`) feeds candles. Both need no credentials. The
+//! instrument status has no channel: `/info perpMeta` is polled for it.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -18,11 +19,12 @@ use nautilus_common::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
             InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-            SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstruments,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeBookDeltas, SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeInstrument, SubscribeInstrumentStatus, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -32,8 +34,8 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{BarType, Data, QuoteTick},
-    enums::BookType,
+    data::{BarType, Data, InstrumentStatus, QuoteTick},
+    enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -62,6 +64,12 @@ use crate::{
 };
 
 const BOOK_CHANNEL: &str = "l2BookDepth";
+/// Mark, oracle and funding of every market in one subscription. `activeAssetCtx` cannot be
+/// used: the venue keeps one market per connection, so a second subscription replaces the
+/// first (seen on mainnet, 12 Nov 2026).
+// shortcut: one frame each 3 s, not each block; upgrade to one connection per market on
+// `activeAssetCtx` if mark prices must be faster.
+const CTX_CHANNEL: &str = "allAssetCtxs";
 const CANDLE_CHANNEL: &str = "candle";
 /// A candle is emitted as a bar this long after its interval ended, unless a later candle
 /// arrived first.
@@ -71,6 +79,7 @@ const BAR_CLOSE_GRACE_MS: u64 = 2_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Deltas,
+    Depth,
     Quotes,
     Trades,
     MarkPrices,
@@ -79,8 +88,9 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Deltas,
+        Self::Depth,
         Self::Quotes,
         Self::Trades,
         Self::MarkPrices,
@@ -90,16 +100,17 @@ impl Kind {
 
     const fn channel(self) -> &'static str {
         match self {
-            Self::Deltas => BOOK_CHANNEL,
+            Self::Deltas | Self::Depth => BOOK_CHANNEL,
             Self::Quotes => "bbo",
             Self::Trades => "trades",
-            Self::MarkPrices | Self::IndexPrices | Self::FundingRates => "activeAssetCtx",
+            Self::MarkPrices | Self::IndexPrices | Self::FundingRates => CTX_CHANNEL,
         }
     }
 
     fn of(data: &Data) -> Option<(Self, InstrumentId)> {
         match data {
             Data::BookDeltas(deltas) => Some((Self::Deltas, deltas.instrument_id)),
+            Data::BookDepth(depth) => Some((Self::Depth, depth.instrument_id)),
             Data::Quote(quote) => Some((Self::Quotes, quote.instrument_id)),
             Data::Trade(trade) => Some((Self::Trades, trade.instrument_id)),
             Data::MarkPrice(mark) => Some((Self::MarkPrices, mark.instrument_id)),
@@ -158,6 +169,9 @@ struct Feed {
     api: Arc<tokio::sync::Mutex<TxflowWebSocketClient>>,
     subscriptions: Arc<DashSet<(Kind, InstrumentId)>>,
     bars: Arc<DashMap<CandleKey, BarType>>,
+    /// Last polled status of each market, and the markets a strategy wants the status of.
+    statuses: Arc<DashMap<InstrumentId, MarketStatusAction>>,
+    status_subscriptions: Arc<DashSet<InstrumentId>>,
     sender: EventSender<DataEvent>,
     clock: &'static AtomicTime,
 }
@@ -177,6 +191,13 @@ impl Feed {
     }
 
     fn wants_channel(&self, channel: &str, instrument_id: InstrumentId) -> bool {
+        if channel == CTX_CHANNEL {
+            // One venue subscription serves every market
+            return self
+                .subscriptions
+                .iter()
+                .any(|key| key.0.channel() == CTX_CHANNEL);
+        }
         Kind::ALL.iter().any(|kind| {
             kind.channel() == channel && self.subscriptions.contains(&(*kind, instrument_id))
         })
@@ -188,7 +209,11 @@ impl Feed {
         coin: &str,
         subscribe: bool,
     ) -> Result<(), TxflowWsError> {
-        let subscription = json!({"type": channel, "coin": coin});
+        let subscription = if channel == CTX_CHANNEL {
+            json!({"type": channel})
+        } else {
+            json!({"type": channel, "coin": coin})
+        };
         let ws = self.node.lock().await;
         if subscribe {
             ws.subscribe(subscription).await
@@ -204,6 +229,43 @@ impl Feed {
             ws.subscribe(subscription).await
         } else {
             ws.unsubscribe(&subscription).await
+        }
+    }
+
+    fn send_status(&self, instrument_id: InstrumentId, action: MarketStatusAction) {
+        let ts = self.clock.get_time_ns();
+        let is_trading = Some(action == MarketStatusAction::Trading);
+        self.send(Data::InstrumentStatus(InstrumentStatus::new(
+            instrument_id,
+            action,
+            ts,
+            ts,
+            None,
+            None,
+            is_trading,
+            None,
+            None,
+        )));
+    }
+
+    /// Reads the status of every market now and then each `every`, and sends the changes of
+    /// the subscribed markets. Never ends.
+    async fn poll_statuses(&self, every: Duration) {
+        let mut timer = tokio::time::interval(every);
+        loop {
+            timer.tick().await;
+            match self.http.request_instrument_statuses().await {
+                Ok(statuses) => {
+                    for (id, action) in statuses {
+                        if self.statuses.insert(id, action) != Some(action)
+                            && self.status_subscriptions.contains(&id)
+                        {
+                            self.send_status(id, action);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("TxFlow instrument status poll failed: {e}"),
+            }
         }
     }
 
@@ -243,13 +305,22 @@ impl Feed {
                     return;
                 };
                 let id = instrument.id();
-                if !self.subscriptions.contains(&(Kind::Deltas, id)) {
+                if !self.wants_channel(BOOK_CHANNEL, id) {
                     state.books.remove(&id);
                     return;
                 }
                 let book = state.books.entry(id).or_default();
                 match book.apply(&frame, &instrument, ts_init) {
-                    Ok(Some(deltas)) => self.send(deltas.into()),
+                    Ok(Some(deltas)) => {
+                        if self.subscriptions.contains(&(Kind::Depth, id)) {
+                            match book.depth(&instrument, deltas.sequence, deltas.ts_event, ts_init)
+                            {
+                                Ok(depth) => self.send(Data::BookDepth(Box::new(depth))),
+                                Err(e) => log::warn!("TxFlow book depth of {id} skipped: {e}"),
+                            }
+                        }
+                        self.send_subscribed(deltas.into());
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         log::warn!("TxFlow book of {id} dropped, subscribing again: {e}");
@@ -288,32 +359,43 @@ impl Feed {
                     }
                 }
             }
-            WsMessage::AssetCtx(frame) => {
-                let Some(instrument) = instruments.lookup(&frame.coin) else {
-                    return;
-                };
-                let id = instrument.id();
-                let (mark, index, funding) = match parse_asset_ctx(&frame.ctx, &instrument, ts_init)
-                {
-                    Ok(updates) => updates,
-                    Err(e) => {
-                        log::warn!("TxFlow asset context of {id} skipped: {e}");
-                        return;
+            WsMessage::AssetCtxs(frames) => {
+                for frame in frames {
+                    let Some(instrument) = instruments.lookup(&frame.coin) else {
+                        continue;
+                    };
+                    let id = instrument.id();
+                    let funding_wanted = self.subscriptions.contains(&(Kind::FundingRates, id));
+                    if !funding_wanted {
+                        // A new subscriber gets the current rate first
+                        state.funding.remove(&id);
                     }
-                };
-                if let Some(mark) = mark {
-                    self.send_subscribed(Data::MarkPrice(mark));
-                }
-                if let Some(index) = index {
-                    self.send_subscribed(Data::IndexPrice(index));
-                }
-                if !self.subscriptions.contains(&(Kind::FundingRates, id)) {
-                    // A new subscriber gets the current rate first
-                    state.funding.remove(&id);
-                } else if let Some(funding) = funding {
-                    let value = (funding.rate, funding.next_funding_ns);
-                    if state.funding.insert(id, value) != Some(value) {
-                        self.send(Data::FundingRate(funding));
+                    // The frame has every market of the venue: the others are not parsed
+                    if !funding_wanted
+                        && !self.subscriptions.contains(&(Kind::MarkPrices, id))
+                        && !self.subscriptions.contains(&(Kind::IndexPrices, id))
+                    {
+                        continue;
+                    }
+                    let (mark, index, funding) =
+                        match parse_asset_ctx(&frame.ctx, &instrument, ts_init) {
+                            Ok(updates) => updates,
+                            Err(e) => {
+                                log::warn!("TxFlow asset context of {id} skipped: {e}");
+                                continue;
+                            }
+                        };
+                    if let Some(mark) = mark {
+                        self.send_subscribed(Data::MarkPrice(mark));
+                    }
+                    if let Some(index) = index {
+                        self.send_subscribed(Data::IndexPrice(index));
+                    }
+                    if let (true, Some(funding)) = (funding_wanted, funding) {
+                        let value = (funding.rate, funding.next_funding_ns);
+                        if state.funding.insert(id, value) != Some(value) {
+                            self.send(Data::FundingRate(funding));
+                        }
                     }
                 }
             }
@@ -381,6 +463,8 @@ impl Feed {
         }
         self.subscriptions.clear();
         self.bars.clear();
+        self.status_subscriptions.clear();
+        self.statuses.clear();
     }
 }
 
@@ -416,6 +500,8 @@ impl TxflowDataClient {
             api: socket(TxflowWebSocketClient::api(api_url)),
             subscriptions: Arc::new(DashSet::new()),
             bars: Arc::new(DashMap::new()),
+            statuses: Arc::new(DashMap::new()),
+            status_subscriptions: Arc::new(DashSet::new()),
             sender: get_data_event_sender(),
             clock: get_atomic_clock_realtime(),
         };
@@ -629,7 +715,15 @@ impl DataClient for TxflowDataClient {
                 return Err(e).context("failed to connect TxFlow API WebSocket");
             }
         };
-        self.feed_task = Some(get_runtime().spawn(self.feed.clone().run(node_rx, api_rx)));
+        let feed = self.feed.clone();
+        let every = Duration::from_secs(self.config.instrument_status_poll_secs.max(1));
+        // One task: stopping it stops the streams and the status poll together
+        self.feed_task = Some(get_runtime().spawn(async move {
+            tokio::select! {
+                () = feed.clone().run(node_rx, api_rx) => {}
+                () = feed.poll_statuses(every) => {}
+            }
+        }));
         self.is_connected = true;
         log::info!(
             "Connected TxFlow data client {}: {count} instruments",
@@ -662,9 +756,31 @@ impl DataClient for TxflowDataClient {
         })
     }
 
+    fn subscribe_instrument_status(
+        &mut self,
+        cmd: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.instrument(&instrument_id)?;
+            self.feed.status_subscriptions.insert(instrument_id);
+            // The status known now; the poll sends each later change
+            let known = self.feed.statuses.get(&instrument_id).map(|action| *action);
+            if let Some(action) = known {
+                self.feed.send_status(instrument_id, action);
+            }
+            Ok(())
+        })
+    }
+
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         validate_book_type(cmd.book_type)?;
         self.subscribe_kind(Kind::Deltas, &cmd.instrument_ids)
+    }
+
+    fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
+        validate_book_type(cmd.book_type)?;
+        // Ten levels per side, whatever `cmd.depth` asks
+        self.subscribe_kind(Kind::Depth, &cmd.instrument_ids)
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
@@ -705,8 +821,22 @@ impl DataClient for TxflowDataClient {
         Ok(())
     }
 
+    fn unsubscribe_instrument_status(
+        &mut self,
+        cmd: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            self.feed.status_subscriptions.remove(&instrument_id);
+            Ok(())
+        })
+    }
+
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         self.unsubscribe_kind(Kind::Deltas, &cmd.instrument_ids)
+    }
+
+    fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
+        self.unsubscribe_kind(Kind::Depth, &cmd.instrument_ids)
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
@@ -909,11 +1039,12 @@ mod tests {
             channels,
             [
                 "l2BookDepth",
+                "l2BookDepth",
                 "bbo",
                 "trades",
-                "activeAssetCtx",
-                "activeAssetCtx",
-                "activeAssetCtx",
+                "allAssetCtxs",
+                "allAssetCtxs",
+                "allAssetCtxs",
             ]
         );
     }

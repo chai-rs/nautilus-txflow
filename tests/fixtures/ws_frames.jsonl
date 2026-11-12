@@ -6,3 +6,4 @@
 {"method":"PONG"}
 {"channel":"candle","data":{"t":1794336420000,"o":"73406.2","h":"73418.6","l":"73383.9","c":"73383.9","v":"0.4363","n":15,"s":"1","i":"1m","T":1794336479999}}
 {"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"candle","coin":"1","interval":"1m"}}}
+{"channel":"allAssetCtxs","data":{"ctxs":[{"coin":"1","ctx":{"funding":"0.00078992","openInterest":"423.6214","oraclePx":"73423.6","markPx":"73390.0","midPx":"73385.9","impactPxs":["73385.8","73385.9"],"lastPrice":"73390.7","nextFundingTime":1794337200000,"prevFundingTime":1794333600000,"blockTime":1794336455397}},{"coin":"64","ctx":{"funding":"0.00125000","openInterest":"1635266","oraclePx":"0.5231","markPx":"0.5230","midPx":"0.5228","impactPxs":["0.5226","0.5231"],"lastPrice":"0.5230","nextFundingTime":1794506400000,"prevFundingTime":1794502800000,"blockTime":1794505169732}}]}}

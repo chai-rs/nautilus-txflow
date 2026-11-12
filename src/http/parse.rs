@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, TradeTick},
-    enums::{OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType},
+    enums::{MarketStatusAction, OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     instruments::{CryptoPerpetual, Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
@@ -77,6 +77,18 @@ pub fn parse_instrument(meta: &PerpMeta, ts_init: UnixNanos) -> anyhow::Result<I
         .build()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(InstrumentAny::CryptoPerpetual(instrument))
+}
+
+/// Trading status of a `perpMeta` market: delisted wins over halted.
+#[must_use]
+pub const fn market_status(meta: &PerpMeta) -> MarketStatusAction {
+    if meta.delisted {
+        MarketStatusAction::NotAvailableForTrading
+    } else if meta.halt_trading {
+        MarketStatusAction::Halt
+    } else {
+        MarketStatusAction::Trading
+    }
 }
 
 /// # Errors
@@ -193,10 +205,10 @@ pub fn parse_asset_ctx(
 
 /// Trade id of a fill: the order id and the filled size of the order after this fill.
 ///
-/// The venue sends no fill id (`userFills` has none and there is no live fills channel), so
-/// the id is built from what both sources agree on. shortcut: a `userFills` window that
-/// misses the first fills of an order gives other ids than the live stream did, upgrade when
-/// the venue sends a fill id.
+/// `userFills` has a venue trade id (`tid`), but no live channel carries it with the order id:
+/// live fills come from `orderUpdates` rows, which have none. So the id is built from what
+/// both sources agree on. shortcut: a `userFills` window that misses the first fills of an
+/// order gives other ids than the live stream did, upgrade when the venue pushes fills.
 ///
 /// # Errors
 ///
@@ -411,4 +423,30 @@ pub fn parse_account_balance(state: &ClearinghouseState) -> anyhow::Result<Accou
         locked,
         Currency::USDC(),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(false, false, MarketStatusAction::Trading)]
+    #[case(false, true, MarketStatusAction::Halt)]
+    #[case(true, false, MarketStatusAction::NotAvailableForTrading)]
+    #[case(true, true, MarketStatusAction::NotAvailableForTrading)]
+    fn market_status_follows_the_flags(
+        #[case] delisted: bool,
+        #[case] halt_trading: bool,
+        #[case] expected: MarketStatusAction,
+    ) {
+        let meta: PerpMeta = serde_json::from_value(serde_json::json!({
+            "name": "BTC-USDC", "baseCurrency": "BTC", "quoteCurrency": "USDC",
+            "basePrecision": "0.0001", "priceTick": "0.1", "maxLeverage": 75, "index": 1,
+            "delisted": delisted, "haltTrading": halt_trading,
+        }))
+        .unwrap();
+        assert_eq!(market_status(&meta), expected);
+    }
 }

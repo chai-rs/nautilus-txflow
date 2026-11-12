@@ -7,11 +7,17 @@
 pub mod dispatch;
 pub mod order;
 
-use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::primitives::Address;
 use anyhow::Context;
 use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
 use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
@@ -36,13 +42,14 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Price, Quantity},
 };
+use rust_decimal::Decimal;
 use serde_json::json;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use self::{
     dispatch::OrderDispatch,
-    order::{Verdict, order_body, verdicts},
+    order::{Verdict, is_tpsl_group, order_body, verdicts},
 };
 use crate::{
     common::{
@@ -50,7 +57,7 @@ use crate::{
             ENV_ACCOUNT_ADDRESS, ENV_AGENT_PRIVATE_KEY, ENV_TESTNET_ACCOUNT_ADDRESS,
             ENV_TESTNET_AGENT_PRIVATE_KEY, MAX_CANCELS_PER_ACTION, MAX_ORDERS_PER_ACTION,
         },
-        enums::{TxflowEnvironment, parse_order_status},
+        enums::{TxflowEnvironment, TxflowMarginMode, parse_order_status},
         instruments::InstrumentCache,
         parse::{millis_to_nanos, wire_decimal},
     },
@@ -68,8 +75,8 @@ use crate::{
         TxflowSigner,
         action::{
             Action, CancelAction, CancelBody, CancelByCloidAction, CancelByCloidBody,
-            CancelGrouping, Grouping, ModifyAction, ModifyBody, OrderAction, OrderBody,
-            UpdateLeverage,
+            CancelGrouping, Grouping, ModifyAction, ModifyBody, OrderAction, OrderBody, OrderKind,
+            UpdateLeverage, UpdateMarginMode,
         },
         nonce::NonceManager,
     },
@@ -114,8 +121,9 @@ struct Cancel {
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     venue_order_id: Option<VenueOrderId>,
-    /// Trigger orders are stored apart from the book and need their own cancel grouping.
-    trigger: bool,
+    /// Trigger orders and TP/SL children are stored apart from the book: the cancel names
+    /// their family.
+    grouping: Option<CancelGrouping>,
 }
 
 #[derive(Debug)]
@@ -140,6 +148,10 @@ struct Shared {
     /// Account address: the owner of orders and positions, not the agent that signs.
     user: String,
     connected_ms: u64,
+    /// Children sent in a `normalTpsl` action of this session.
+    tpsl: DashSet<ClientOrderId>,
+    /// Margin mode of the markets switched with `updateMarginMode`; the others use the config.
+    margin_modes: DashMap<InstrumentId, TxflowMarginMode>,
 }
 
 impl Shared {
@@ -154,6 +166,12 @@ impl Shared {
 
     async fn submit(&self, grouping: Grouping, requests: &[(ClientOrderId, OrderBody)]) {
         for chunk in requests.chunks(MAX_ORDERS_PER_ACTION) {
+            if grouping == Grouping::NormalTpsl {
+                // Before the answer: an action without a clear answer may still have run
+                for (client_order_id, _) in &chunk[1..] {
+                    self.tpsl.insert(*client_order_id);
+                }
+            }
             let orders = chunk.iter().map(|(_, body)| body.clone()).collect();
             let result = self
                 .send(&Action::Order(OrderAction { grouping, orders }))
@@ -175,9 +193,54 @@ impl Shared {
                     ),
                 }
             }
-            if grouping == Grouping::NormalTrigger && !sent.is_empty() {
-                self.accept_triggers(&sent).await;
+            match grouping {
+                Grouping::NormalTrigger if !sent.is_empty() => self.accept_triggers(&sent).await,
+                // The first order is the parent, a book order: the order stream shows it
+                Grouping::NormalTpsl if !sent.is_empty() => self.accept_tpsl(&chunk[1..]).await,
+                _ => {}
             }
+        }
+    }
+
+    /// TP/SL children are stored apart from the book, as a pair without a client order id of
+    /// its own: each child is matched on its market and trigger price, and gets the order id
+    /// of that leg.
+    ///
+    /// unverified: whether the pair is listed before the parent fills. A child that is not
+    /// found stays submitted until a row of the order stream shows it.
+    async fn accept_tpsl(&self, children: &[(ClientOrderId, OrderBody)]) {
+        let legs = match self.http.request_tpsl_orders(&self.user).await {
+            Ok(legs) => legs,
+            Err(e) => {
+                log::warn!("TxFlow TP/SL order lookup failed: {e}");
+                return;
+            }
+        };
+        for (client_order_id, body) in children {
+            let OrderKind::Trigger { trigger_px, .. } = &body.t else {
+                continue;
+            };
+            let trigger_px = trigger_px.parse::<Decimal>().ok();
+            // The newest pair wins when an older one has the same trigger price
+            let leg = legs
+                .iter()
+                .filter(|leg| leg.asset == Some(u64::from(body.a)) && leg.trigger_px == trigger_px)
+                .max_by_key(|leg| leg.oid);
+            if let Some(leg) = leg {
+                let ts_event = leg.timestamp.map_or_else(now, millis_to_nanos);
+                self.dispatch.accepted(client_order_id, leg.oid, ts_event);
+            }
+        }
+    }
+
+    /// The order family a cancel must name.
+    fn cancel_grouping(&self, order: &OrderAny) -> Option<CancelGrouping> {
+        // shortcut: the TP/SL children are known for this session only, after a restart their
+        // cancel goes out as `trigger`; read `tpslOrders` first when that matters.
+        if self.tpsl.contains(&order.client_order_id()) {
+            Some(CancelGrouping::Tpsl)
+        } else {
+            is_trigger(order.order_type()).then_some(CancelGrouping::Trigger)
         }
     }
 
@@ -225,7 +288,7 @@ impl Shared {
                 self.cancel_rejected(&cancel, "unknown instrument");
                 continue;
             };
-            let grouping = cancel.trigger.then_some(CancelGrouping::Trigger);
+            let grouping = cancel.grouping;
             let oid = self
                 .dispatch
                 .venue_order_id(&cancel.client_order_id)
@@ -267,8 +330,8 @@ impl Shared {
         for (cancel, verdict) in cancels.iter().zip(verdicts(&result, cancels.len())) {
             match verdict {
                 // The `Canceled` row of the order stream closes a book order. A trigger order
-                // may never get a row (unverified), so the answer closes it.
-                Verdict::Sent if cancel.trigger => {
+                // or TP/SL child may never get a row (unverified), so the answer closes it.
+                Verdict::Sent if cancel.grouping.is_some() => {
                     self.dispatch.canceled(&cancel.client_order_id, now());
                 }
                 Verdict::Sent => {}
@@ -307,24 +370,93 @@ impl Shared {
         }
     }
 
+    /// Sends an action without orders. An error if the venue refused it or gave no clear
+    /// answer.
+    async fn send_setting(&self, action: &Action) -> anyhow::Result<()> {
+        match verdicts(&self.send(action).await, 1).pop() {
+            Some(Verdict::Rejected(reason) | Verdict::Unknown(reason)) => anyhow::bail!(reason),
+            _ => Ok(()),
+        }
+    }
+
+    fn asset(&self, instrument_id: &InstrumentId) -> anyhow::Result<u32> {
+        self.instruments
+            .asset(instrument_id)
+            .with_context(|| format!("unknown instrument {instrument_id}"))
+    }
+
     async fn update_leverage(
         &self,
         instrument_id: &InstrumentId,
         leverage: u32,
+        margin_mode: Option<TxflowMarginMode>,
     ) -> anyhow::Result<()> {
-        let asset = self
-            .instruments
-            .asset(instrument_id)
-            .with_context(|| format!("unknown instrument {instrument_id} in the config"))?;
         let action = Action::UpdateLeverage(UpdateLeverage {
-            asset,
+            asset: self.asset(instrument_id)?,
             leverage: i32::try_from(leverage).context("leverage out of range")?,
-            margin_mode: None,
+            margin_mode,
         });
-        match verdicts(&self.send(&action).await, 1).pop() {
-            Some(Verdict::Rejected(reason) | Verdict::Unknown(reason)) => anyhow::bail!(reason),
-            _ => Ok(()),
+        self.send_setting(&action).await
+    }
+
+    async fn update_margin_mode(
+        &self,
+        instrument_id: InstrumentId,
+        margin_mode: TxflowMarginMode,
+    ) -> anyhow::Result<()> {
+        let action = Action::UpdateMarginMode(UpdateMarginMode {
+            asset: self.asset(&instrument_id)?,
+            is_cross: margin_mode == TxflowMarginMode::Cross,
+        });
+        self.send_setting(&action).await?;
+        // Every order names its margin mode, so the orders of this market follow the switch
+        self.margin_modes.insert(instrument_id, margin_mode);
+        Ok(())
+    }
+
+    /// Position reports of a `clearinghouseState` frame, for the markets whose size changed
+    /// since the frame before (`last`). The venue lists open positions only: a market that
+    /// left the list is reported flat.
+    fn emit_positions(
+        &self,
+        state: &ClearinghouseState,
+        last: &mut HashMap<InstrumentId, Decimal>,
+    ) {
+        let ts_init = now();
+        let mut listed = HashMap::new();
+        for entry in &state.asset_positions {
+            let position = &entry.position;
+            match self.instruments.lookup(&position.instrument_key()) {
+                Some(instrument) => {
+                    listed.insert(instrument.id(), (position.clone(), instrument));
+                }
+                None => log::warn!("Position on unknown market {}", position.coin),
+            }
         }
+        for id in last.keys() {
+            if !listed.contains_key(id)
+                && let Some(instrument) = self.instruments.get(id)
+            {
+                listed.insert(*id, (Position::default(), instrument));
+            }
+        }
+        let mut sizes = HashMap::new();
+        for (id, (position, instrument)) in listed {
+            let size = position.szi.unwrap_or_default();
+            if !size.is_zero() {
+                sizes.insert(id, size);
+            }
+            // An unchanged position is not sent again: each report restarts the grace window
+            // of the engine's position check
+            if last.get(&id).copied().unwrap_or_default() == size {
+                continue;
+            }
+            match parse_position_status_report(&position, self.account_id, &instrument, ts_init) {
+                Ok(report) => self.emitter.send_position_report(report),
+                Err(e) => log::warn!("TxFlow position of {id} unreadable: {e}"),
+            }
+        }
+        *last = sizes;
     }
 
     fn emit_balance(&self, state: &ClearinghouseState) {
@@ -347,7 +479,7 @@ impl Shared {
         self.connected_ms.saturating_sub(CATCH_UP_OVERLAP_MS)
     }
 
-    /// Resting orders of the book and pending trigger orders.
+    /// Resting orders of the book, pending trigger orders and pending TP/SL orders.
     async fn open_rows(&self) -> anyhow::Result<Vec<OrderRow>> {
         let mut rows: Vec<OrderRow> = self
             .http
@@ -356,12 +488,23 @@ impl Shared {
             .into_iter()
             .map(open_row)
             .collect();
-        let listed: HashSet<u64> = rows.iter().map(|row| row.order.oid).collect();
+        let mut listed: HashSet<u64> = rows.iter().map(|row| row.order.oid).collect();
         let triggers = self.http.request_trigger_orders(&self.user).await?;
+        let tpsl = match self.http.request_tpsl_orders(&self.user).await {
+            Ok(legs) => legs,
+            // unverified: `tpslOrders` was never read live. An answer the adapter cannot use
+            // must not stop the reports of the other orders.
+            Err(e @ (TxflowHttpError::Venue { .. } | TxflowHttpError::Parse(_))) => {
+                log::warn!("TxFlow TP/SL orders left out of the order reports: {e}");
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
         rows.extend(
             triggers
                 .into_iter()
-                .filter(|order| !listed.contains(&order.oid))
+                .chain(tpsl)
+                .filter(|order| listed.insert(order.oid))
                 .map(open_row),
         );
         Ok(rows)
@@ -487,14 +630,8 @@ impl Shared {
         if reports.is_empty()
             && let Some(instrument) = instrument_id.and_then(|id| self.instruments.get(&id))
         {
-            let flat = Position {
-                coin: String::new(),
-                asset: None,
-                szi: None,
-                entry_px: None,
-            };
             reports.push(parse_position_status_report(
-                &flat,
+                &Position::default(),
                 self.account_id,
                 &instrument,
                 ts_init,
@@ -532,6 +669,8 @@ async fn consume(
     mut rx: UnboundedReceiver<WsMessage>,
     cancel: CancellationToken,
 ) {
+    // Position sizes of the last `clearinghouseState` frame
+    let mut positions = HashMap::new();
     loop {
         let message = tokio::select! {
             () = cancel.cancelled() => break,
@@ -546,7 +685,10 @@ async fn consume(
                     shared.dispatch.handle_row(row, now());
                 }
             }
-            WsMessage::ClearinghouseState(state) => shared.emit_balance(&state),
+            WsMessage::ClearinghouseState(state) => {
+                shared.emit_balance(&state);
+                shared.emit_positions(&state, &mut positions);
+            }
             WsMessage::Reconnected => shared.catch_up().await,
             _ => {}
         }
@@ -613,26 +755,62 @@ impl TxflowExecutionClient {
             .instruments
             .get(&instrument_id)
             .with_context(|| format!("unknown instrument {instrument_id}"))?;
-        let asset = shared
-            .instruments
-            .asset(&instrument_id)
-            .with_context(|| format!("unknown instrument {instrument_id}"))?;
+        let margin_mode = shared
+            .margin_modes
+            .get(&instrument_id)
+            .map_or(self.config.margin_mode, |mode| *mode);
         order_body(
             order,
-            asset,
+            shared.asset(&instrument_id)?,
             &instrument,
             self.core.cache().quote(&instrument_id),
             slippage_bps,
-            self.config.margin_mode,
+            margin_mode,
         )
+    }
+
+    fn slippage_bps(&self, params: Option<&Params>) -> u32 {
+        params
+            .and_then(|params| params.get_u64("market_order_slippage_bps"))
+            .and_then(|bps| u32::try_from(bps).ok())
+            .unwrap_or(self.config.market_order_slippage_bps)
+    }
+
+    /// A parent order with its TP/SL children goes out as one `normalTpsl` action: the venue
+    /// arms the children with the parent and cancels one child when the other fires.
+    fn submit_tpsl(&self, orders: &[OrderAny], params: Option<&Params>) -> anyhow::Result<()> {
+        let shared = self.shared()?;
+        let slippage_bps = self.slippage_bps(params);
+        // unverified: the docs name `normalTpsl` and show no request. The parent first, then
+        // the children as trigger orders with `tpsl` set, is the Hyperliquid convention.
+        let requests: anyhow::Result<Vec<_>> = orders
+            .iter()
+            .map(|order| {
+                let (_, body) = self.request(&shared, order, slippage_bps)?;
+                Ok((order.client_order_id(), body))
+            })
+            .collect();
+        match requests {
+            Ok(requests) => {
+                for order in orders {
+                    self.emitter.emit_order_submitted(order);
+                    shared.dispatch.track(order);
+                }
+                spawn(async move { shared.submit(Grouping::NormalTpsl, &requests).await });
+            }
+            // One action: an order the venue cannot take stops the whole group
+            Err(e) => {
+                for order in orders {
+                    self.emitter.emit_order_denied(order, &e.to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn submit(&self, orders: Vec<OrderAny>, params: Option<&Params>) -> anyhow::Result<()> {
         let shared = self.shared()?;
-        let slippage_bps = params
-            .and_then(|params| params.get_u64("market_order_slippage_bps"))
-            .and_then(|bps| u32::try_from(bps).ok())
-            .unwrap_or(self.config.market_order_slippage_bps);
+        let slippage_bps = self.slippage_bps(params);
         let mut plain = Vec::new();
         let mut triggers = Vec::new();
         for order in orders {
@@ -647,7 +825,7 @@ impl TxflowExecutionClient {
                     let request = (order.client_order_id(), body);
                     match grouping {
                         Grouping::Na => plain.push(request),
-                        Grouping::NormalTrigger => triggers.push(request),
+                        _ => triggers.push(request),
                     }
                 }
                 Err(e) => self.emitter.emit_order_denied(&order, &e.to_string()),
@@ -706,33 +884,77 @@ impl TxflowExecutionClient {
         })
     }
 
-    fn cancel_of(
-        &self,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-    ) -> Cancel {
-        let trigger = self
+    fn cancel_cmd(&self, shared: &Shared, cmd: &CancelOrder) -> Cancel {
+        let grouping = self
             .core
-            .get_order(&client_order_id)
-            .is_ok_and(|order| is_trigger(order.order_type()));
+            .get_order(&cmd.client_order_id)
+            .ok()
+            .and_then(|order| shared.cancel_grouping(&order));
         Cancel {
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            trigger,
+            strategy_id: cmd.strategy_id,
+            instrument_id: cmd.instrument_id,
+            client_order_id: cmd.client_order_id,
+            venue_order_id: cmd.venue_order_id,
+            grouping,
         }
     }
 
-    fn cancel_cmd(&self, cmd: &CancelOrder) -> Cancel {
-        self.cancel_of(
-            cmd.strategy_id,
-            cmd.instrument_id,
-            cmd.client_order_id,
-            cmd.venue_order_id,
-        )
+    /// Sets the leverage of one market (`updateLeverage`). `margin_mode` names the margin
+    /// mode the leverage is for; without it the venue takes the current mode of the market.
+    ///
+    /// Not a command of the execution trait: call it from strategy or bootstrap code. The
+    /// action goes out in the background and its answer is logged. The venue refuses it
+    /// while the market has open orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not connected, the instrument is unknown, or the
+    /// leverage is zero.
+    pub fn update_leverage(
+        &self,
+        instrument_id: InstrumentId,
+        leverage: u32,
+        margin_mode: Option<TxflowMarginMode>,
+    ) -> anyhow::Result<()> {
+        let shared = self.shared()?;
+        shared.asset(&instrument_id)?;
+        anyhow::ensure!(leverage > 0, "leverage must be positive");
+        spawn(async move {
+            match shared
+                .update_leverage(&instrument_id, leverage, margin_mode)
+                .await
+            {
+                Ok(()) => log::info!("TxFlow leverage of {instrument_id} set to {leverage}"),
+                Err(e) => log::error!("TxFlow leverage update of {instrument_id} failed: {e}"),
+            }
+        });
+        Ok(())
+    }
+
+    /// Switches one market between cross and isolated margin (`updateMarginMode`). Once the
+    /// venue confirmed, the orders of that market carry the new mode instead of the mode of
+    /// the config, until the client disconnects.
+    ///
+    /// Not a command of the execution trait: call it from strategy or bootstrap code. The
+    /// action goes out in the background and its answer is logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not connected or the instrument is unknown.
+    pub fn update_margin_mode(
+        &self,
+        instrument_id: InstrumentId,
+        margin_mode: TxflowMarginMode,
+    ) -> anyhow::Result<()> {
+        let shared = self.shared()?;
+        shared.asset(&instrument_id)?;
+        spawn(async move {
+            match shared.update_margin_mode(instrument_id, margin_mode).await {
+                Ok(()) => log::info!("TxFlow margin mode of {instrument_id} set to {margin_mode}"),
+                Err(e) => log::error!("TxFlow margin mode update of {instrument_id} failed: {e}"),
+            }
+        });
+        Ok(())
     }
 }
 
@@ -831,10 +1053,12 @@ impl ExecutionClient for TxflowExecutionClient {
             account_id: self.core.account_id,
             user: format!("{address:#x}"),
             connected_ms: now().as_u64() / 1_000_000,
+            tpsl: DashSet::new(),
+            margin_modes: DashMap::new(),
         });
         for (instrument_id, leverage) in &config.leverage {
             shared
-                .update_leverage(instrument_id, *leverage)
+                .update_leverage(instrument_id, *leverage, None)
                 .await
                 .with_context(|| format!("setting the leverage of {instrument_id}"))?;
         }
@@ -878,6 +1102,9 @@ impl ExecutionClient for TxflowExecutionClient {
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+        if is_tpsl_group(&orders) {
+            return self.submit_tpsl(&orders, cmd.params.as_ref());
+        }
         self.submit(orders, cmd.params.as_ref())
     }
 
@@ -901,7 +1128,7 @@ impl ExecutionClient for TxflowExecutionClient {
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let shared = self.shared()?;
-        let cancels = vec![self.cancel_cmd(&cmd)];
+        let cancels = vec![self.cancel_cmd(&shared, &cmd)];
         spawn(async move { shared.cancel(cancels).await });
         Ok(())
     }
@@ -925,7 +1152,7 @@ impl ExecutionClient for TxflowExecutionClient {
                 instrument_id: order.instrument_id(),
                 client_order_id: order.client_order_id(),
                 venue_order_id: order.venue_order_id(),
-                trigger: is_trigger(order.order_type()),
+                grouping: shared.cancel_grouping(order),
             })
             .collect();
         spawn(async move { shared.cancel(cancels).await });
@@ -937,7 +1164,7 @@ impl ExecutionClient for TxflowExecutionClient {
         let cancels = cmd
             .cancels
             .iter()
-            .map(|cancel| self.cancel_cmd(cancel))
+            .map(|cancel| self.cancel_cmd(&shared, cancel))
             .collect();
         spawn(async move { shared.cancel(cancels).await });
         Ok(())

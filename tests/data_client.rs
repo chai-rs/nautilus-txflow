@@ -4,7 +4,14 @@
 //! and each stream subscription with the frames recorded from the public streams
 //! (`tests/fixtures/ws_frames.jsonl`).
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -22,15 +29,15 @@ use nautilus_common::{
         DataEvent, DataResponse,
         data::{
             RequestBars, RequestBookSnapshot, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices, SubscribeQuotes,
-            UnsubscribeBookDeltas,
+            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeInstrumentStatus, SubscribeMarkPrices, SubscribeQuotes, UnsubscribeBookDeltas,
         },
     },
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{BarType, Data},
-    enums::{BookAction, BookType},
+    enums::{BookAction, BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId},
     instruments::Instrument,
     types::Price,
@@ -47,10 +54,23 @@ const FRAMES: &str = include_str!("fixtures/ws_frames.jsonl");
 /// Every frame the stand-in received, with the path of its socket.
 type Received = Arc<Mutex<Vec<(&'static str, Value)>>>;
 
+/// While set, the stand-in shows the BTC market of `perpMeta` as halted.
+static HALT_BTC: AtomicBool = AtomicBool::new(false);
+
 async fn info(Json(request): Json<Value>) -> String {
     let kind = request["type"].as_str().unwrap_or_default();
     let path = format!("{}/tests/fixtures/{kind}.json", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    if kind == "perpMeta" && HALT_BTC.load(Ordering::SeqCst) {
+        let mut meta: Value = serde_json::from_str(&body).unwrap();
+        for market in meta["data"]["universe"].as_array_mut().unwrap() {
+            if market["name"] == "BTC-USDC" {
+                market["haltTrading"] = true.into();
+            }
+        }
+        return meta.to_string();
+    }
+    body
 }
 
 /// Lines of the recorded frames the venue sends after a subscription to `channel`.
@@ -58,7 +78,7 @@ fn frames_of(channel: &str) -> &'static [usize] {
     match channel {
         "l2BookDepth" => &[0, 2],
         "bbo" => &[1],
-        "activeAssetCtx" => &[3],
+        "allAssetCtxs" => &[8],
         "candle" => &[7, 6],
         _ => &[],
     }
@@ -149,6 +169,7 @@ async fn connect() -> (TxflowDataClient, UnboundedReceiver<DataEvent>, Received)
     replace_data_event_sender(sender);
     let config = TxflowDataClientConfig {
         base_url_http: Some(url),
+        instrument_status_poll_secs: 1,
         ..Default::default()
     };
     let mut client = TxflowDataClient::new(client_id(), config).unwrap();
@@ -316,7 +337,7 @@ async fn streams_become_book_deltas_quotes_prices_funding_and_bars() {
         [
             ("/ws", r#"{"coin":"1","type":"l2BookDepth"}"#.to_string()),
             ("/ws", r#"{"coin":"1","type":"bbo"}"#.to_string()),
-            ("/ws", r#"{"coin":"1","type":"activeAssetCtx"}"#.to_string()),
+            ("/ws", r#"{"type":"allAssetCtxs"}"#.to_string()),
             (
                 "/api-ws",
                 r#"{"coin":"1","interval":"1m","type":"candle"}"#.to_string()
@@ -342,6 +363,85 @@ async fn streams_become_book_deltas_quotes_prices_funding_and_bars() {
 
     client.disconnect().await.unwrap();
     assert!(client.is_disconnected());
+}
+
+#[tokio::test]
+async fn book_depth_is_cut_from_the_stream_and_status_follows_the_market_list() {
+    let (mut client, mut events, received) = connect().await;
+    let id = Some(client_id());
+    let now = UnixNanos::default;
+
+    // Depth alone: the book channel is subscribed once and no deltas go out
+    client
+        .subscribe_book_depth(SubscribeBookDepth::new(
+            btc(),
+            BookType::L2_MBP,
+            id,
+            None,
+            UUID4::new(),
+            now(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .unwrap();
+    let Data::BookDepth(depth) = next_data(&mut events).await else {
+        panic!("expected the depth of the snapshot");
+    };
+    assert_eq!(depth.instrument_id, btc());
+    // The recorded snapshot is cut to five levels per side
+    assert_eq!((depth.bids.len(), depth.asks.len()), (5, 5));
+    assert_eq!(depth.bids[0].price, Price::from("73382.0"));
+    assert_eq!(depth.asks[0].price, Price::from("73382.2"));
+    assert_eq!(depth.bid_counts[0], 1);
+    assert_eq!(depth.sequence, 674_411);
+    // The recorded delta adds one bid and two asks
+    let Data::BookDepth(after) = next_data(&mut events).await else {
+        panic!("expected the depth after the delta");
+    };
+    assert_eq!(after.sequence, 674_412);
+    assert_eq!((after.bids.len(), after.asks.len()), (6, 7));
+    assert_eq!(after.bids[5].price, Price::from("73381.2"));
+    assert_eq!(after.bid_counts[5], 2);
+    assert_eq!(after.asks[6].price, Price::from("73476.3"));
+    assert!(
+        after
+            .asks
+            .windows(2)
+            .all(|pair| pair[0].price < pair[1].price)
+    );
+    let subscribed = wait_received(&received, 1).await;
+    assert_eq!(subscribed[0].1["subscription"]["type"], "l2BookDepth");
+
+    // Status: the one of the market list now, then each change the poll sees
+    client
+        .subscribe_instrument_status(SubscribeInstrumentStatus::new(
+            btc(),
+            id,
+            None,
+            UUID4::new(),
+            now(),
+            None,
+            None,
+        ))
+        .unwrap();
+    let Data::InstrumentStatus(status) = next_data(&mut events).await else {
+        panic!("expected the instrument status");
+    };
+    assert_eq!(status.instrument_id, btc());
+    assert_eq!(status.action, MarketStatusAction::Trading);
+    assert_eq!(status.is_trading, Some(true));
+
+    HALT_BTC.store(true, Ordering::SeqCst);
+    let Data::InstrumentStatus(status) = next_data(&mut events).await else {
+        panic!("expected the halt");
+    };
+    HALT_BTC.store(false, Ordering::SeqCst);
+    assert_eq!(status.action, MarketStatusAction::Halt);
+    assert_eq!(status.is_trading, Some(false));
+
+    client.disconnect().await.unwrap();
 }
 
 #[tokio::test]

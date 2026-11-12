@@ -4,13 +4,20 @@
 //! whose `prevSeq` is the `seq` of the frame before. Full snapshots come again every few
 //! seconds. A delta that does not follow the last frame is a gap: the book is dropped until
 //! the next snapshot.
+//!
+//! The levels of the applied frames are kept, so the best ten per side can be cut from them
+//! as a depth snapshot.
+
+use std::collections::BTreeMap;
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{BookOrder, OrderBookDelta, OrderBookDeltas},
+    data::{BookOrder, DEPTH10_LEN, OrderBookDelta, OrderBookDeltas, OrderBookDepth},
     enums::{BookAction, OrderSide, RecordFlag},
     instruments::{Instrument, InstrumentAny},
 };
+
+use rust_decimal::Decimal;
 
 use crate::{
     common::parse::{millis_to_nanos, price_from_decimal, quantity_from_decimal},
@@ -27,11 +34,13 @@ pub enum BookError {
     Invalid(#[from] anyhow::Error),
 }
 
-/// Sequence state of one market.
+/// Sequence state and levels of one market.
 #[derive(Debug, Default)]
 pub struct BookSync {
     /// `seq` of the last applied frame. `None` while waiting for a snapshot.
     seq: Option<u64>,
+    /// Levels by price, bids then asks. Valid while `seq` is set.
+    levels: [BTreeMap<Decimal, Level>; 2],
 }
 
 impl BookSync {
@@ -52,6 +61,8 @@ impl BookSync {
         if frame.kind == "snapshot" {
             let deltas = snapshot_deltas(instrument, &frame.levels, frame.seq, ts_event, ts_init)?;
             self.seq = Some(frame.seq);
+            self.levels = Default::default();
+            self.keep(&frame.levels);
             return Ok(Some(deltas));
         }
 
@@ -97,7 +108,56 @@ impl BookSync {
             }
         }
         self.seq = Some(frame.seq);
+        self.keep(&frame.levels);
         Ok(finish(instrument, deltas)?)
+    }
+
+    /// Size zero removes a level.
+    fn keep(&mut self, levels: &Levels) {
+        for (book, (_, levels)) in self.levels.iter_mut().zip(sides(levels)) {
+            for level in levels {
+                if level.sz.is_zero() {
+                    book.remove(&level.px);
+                } else {
+                    book.insert(level.px, level.clone());
+                }
+            }
+        }
+    }
+
+    /// The best ten levels per side after the last applied frame, with the order count of
+    /// each level.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a level does not fit the instrument.
+    pub fn depth(
+        &self,
+        instrument: &InstrumentAny,
+        sequence: u64,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<OrderBookDepth> {
+        let [bids, asks] = &self.levels;
+        let side = |side, levels: &mut dyn Iterator<Item = &Level>| {
+            levels
+                .take(DEPTH10_LEN)
+                .map(|level| Ok((order(instrument, side, level)?, level.n)))
+                .collect::<anyhow::Result<(Vec<_>, Vec<_>)>>()
+        };
+        let (bids, bid_counts) = side(OrderSide::Buy, &mut bids.values().rev())?;
+        let (asks, ask_counts) = side(OrderSide::Sell, &mut asks.values())?;
+        OrderBookDepth::new_checked(
+            instrument.id(),
+            bids,
+            asks,
+            bid_counts,
+            ask_counts,
+            RecordFlag::F_SNAPSHOT as u8,
+            sequence,
+            ts_event,
+            ts_init,
+        )
     }
 }
 
@@ -216,6 +276,37 @@ mod tests {
         assert_eq!(delta.deltas[1].order.side, Some(OrderSide::Sell));
         assert_eq!(delta.deltas[0].flags, 0);
         assert_eq!(delta.deltas[1].flags, RecordFlag::F_LAST as u8);
+    }
+
+    #[rstest]
+    fn depth_is_cut_from_the_kept_levels() {
+        let instrument = instrument();
+        let mut sync = BookSync::default();
+        let ts = UnixNanos::from(5);
+        // Twelve bids from 100.0 down: only the best ten are in the depth
+        let bids: Vec<String> = (0..12)
+            .map(|i| format!(r#"{{"px":"{}.0","sz":"1.0000","n":{}}}"#, 100 - i, i + 1))
+            .collect();
+        let snapshot = format!(
+            r#"{{"id":1,"time":1,"seq":10,"prevSeq":null,"type":"snapshot","levels":[[{}],[{{"px":"101.0","sz":"2.0000","n":3}}]]}}"#,
+            bids.join(",")
+        );
+        sync.apply(&frame(&snapshot), &instrument, ts).unwrap();
+        // The delta removes the best bid and adds a better ask
+        let delta = r#"{"id":1,"time":2,"seq":11,"prevSeq":10,"type":"delta","levels":[[{"px":"100.0","sz":"0","n":0}],[{"px":"100.5","sz":"0.5000","n":1}]]}"#;
+        sync.apply(&frame(delta), &instrument, ts).unwrap();
+
+        let depth = sync.depth(&instrument, 11, ts, ts).unwrap();
+        let prices = |orders: &[BookOrder]| -> Vec<String> {
+            orders.iter().map(|order| order.price.to_string()).collect()
+        };
+        assert_eq!(depth.bids.len(), 10);
+        assert_eq!(prices(&depth.bids)[..2], ["99.0", "98.0"]);
+        assert_eq!(depth.bids[9].price.to_string(), "90.0");
+        assert_eq!(depth.bid_counts[0], 2);
+        assert_eq!(prices(&depth.asks), ["100.5", "101.0"]);
+        assert_eq!(depth.ask_counts[..], [1, 3]);
+        assert_eq!(depth.sequence, 11);
     }
 
     #[rstest]
