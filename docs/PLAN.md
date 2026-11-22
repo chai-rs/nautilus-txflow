@@ -91,6 +91,10 @@ Data and transport:
 19. Request `coin` is the instrument id as a string (`"1"`). Response `coin` varies (`BTC-USDC`,
     `BTC`, `"1"`), so responses are matched on `id` / `instrumentId` / the subscription.
 20. `/ws` subscribe frames carry the channel type at the top level too. No acknowledgement.
+    One subscription per frame: the documentation defines `coin` as a single id and no list
+    form, so `l2BookDepth`, `bbo` and `trades` each cost one frame per market. Only
+    `allAssetCtxs` serves every market at once. Outbound frames are therefore paced
+    (`WS_MESSAGES_PER_SEC`) rather than batched.
 21. Client ping `{"method":"ping"}` every 10 s; the gateway closes after about 16 s of silence.
 22. Candles and ticker are on a second endpoint, `/api-ws`.
 23. `l2BookDepth` sends snapshot and delta frames with `seq`/`prevSeq`.

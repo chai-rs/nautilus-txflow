@@ -30,6 +30,13 @@ pub const MAX_PAGE_ROWS: usize = 2000;
 /// The gateway closes a socket after about 16 s without a client frame.
 pub const WS_PING_SECS: u64 = 10;
 pub const WS_PING: &str = r#"{"method":"ping"}"#;
+/// Outbound subscribe and unsubscribe frames per second on one connection. The venue
+/// documents no WebSocket message limit and acknowledges nothing, so this is a self-imposed
+/// pace: 25 markets over the three per-coin channels is about 75 frames at a cold start.
+/// The heartbeat is sent by the transport and is not paced.
+// shortcut: the rate is a guess, since the venue publishes no WebSocket message limit; raise
+// it if a wide cold start is too slow, lower it if the venue starts dropping connections.
+pub const WS_MESSAGES_PER_SEC: u32 = 10;
 
 /// Funding settles every hour.
 pub const FUNDING_INTERVAL_MINS: u16 = 60;

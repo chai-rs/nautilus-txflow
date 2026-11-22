@@ -286,6 +286,8 @@ section.
 | `src/execution/dispatch.rs:82` | shortcut | Closed orders stay tracked until the map is full, then all of them are dropped |
 | `src/execution/dispatch.rs:289` | shortcut | Without an average fill price the limit price stands in |
 | `src/execution/mod.rs:646` | shortcut | The catch-up window starts at connect, so each reconnect reads all orders since connect again |
+| `src/common/consts.rs:37` | shortcut | `WS_MESSAGES_PER_SEC` is 10, a guess: the venue publishes no WebSocket message limit and acknowledges no subscribe, so the pace is open loop |
+| `src/data/mod.rs:217` | shortcut | A paced send holds the stream lock, so a wide cold start delays `connect` and `close` by as long as it paces |
 | `bin/flatten.rs:75` | unverified | Values of `leverage.type` of a position. "Cross" and "Isolated" are read without case; another value sends the close order without `m` |
 | `bin/flatten.rs:108` | unverified | Whether one order shows in two of `tpslOrders`, `triggerOrders`, `frontendOpenOrders`. It is cancelled once, with the family of the most specific list |
 | `bin/flatten.rs:252` | unverified | `tpslOrders` was never read live. If it fails, the flatten leaves the TP/SL orders out and says so |
