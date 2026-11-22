@@ -66,6 +66,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["parking_lot", "rt-multi-thread", "sync", "fs", "io-util", "net", "time", "macros", "signal"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = "0.7.20"
+# Quota keys of the WebSocket client are `Ustr`; the version follows `nautilus-network`.
+ustr = "1.1.0"
 zeroize = "1.9.1"
 
 [dev-dependencies]

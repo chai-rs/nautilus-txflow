@@ -1,26 +1,36 @@
 //! WebSocket client for the two TxFlow streams.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    num::NonZeroU32,
+    sync::{Arc, LazyLock},
+};
 
 use nautilus_common::live::get_runtime;
 use nautilus_network::{
     RECONNECTED,
+    ratelimiter::quota::Quota,
     websocket::{WebSocketClient, WebSocketConfig, channel_message_handler},
 };
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_tungstenite::tungstenite::Message;
+use ustr::Ustr;
 
 use super::{
     error::TxflowWsError,
     messages::{WsMessage, parse_frame},
 };
-use crate::common::consts::{WS_PING, WS_PING_SECS};
+use crate::common::consts::{WS_MESSAGES_PER_SEC, WS_PING, WS_PING_SECS};
 
 const RECONNECT_DELAY_INITIAL_MS: u64 = 250;
 const RECONNECT_DELAY_MAX_MS: u64 = 30_000;
 const RECONNECT_BACKOFF_FACTOR: f64 = 2.0;
 const RECONNECT_JITTER_MS: u64 = 200;
+
+/// Quota key of every frame this client writes. One key, so the whole connection shares
+/// [`WS_MESSAGES_PER_SEC`].
+static SEND_KEYS: LazyLock<[Ustr; 1]> = LazyLock::new(|| [Ustr::from("txflow:ws:messages")]);
 
 /// The subscription objects the caller wants, sent again after every reconnect: the venue
 /// forgets them when a connection ends.
@@ -31,6 +41,10 @@ type Subscriptions = Arc<parking_lot::Mutex<Vec<Value>>>;
 /// No authentication: user channels take the account address in the subscription.
 /// Subscribing before [`Self::connect`] only records the subscription. A subscribe whose send
 /// fails stays recorded and is sent on the next reconnect.
+///
+/// Every outbound frame is paced at [`WS_MESSAGES_PER_SEC`], the live path and the replay
+/// after a reconnect alike, so a wide universe cannot burst the socket. A send therefore waits
+/// for the quota before it returns.
 pub struct TxflowWebSocketClient {
     url: String,
     /// `/ws` routes on a top-level `type` next to `subscription`; `/api-ws` does not use it.
@@ -93,10 +107,14 @@ impl TxflowWebSocketClient {
             .reconnect_jitter_ms(RECONNECT_JITTER_MS)
             .build()
             .map_err(|e| TxflowWsError::Client(e.to_string()))?;
+        let quota = NonZeroU32::new(WS_MESSAGES_PER_SEC)
+            .and_then(Quota::per_second)
+            .ok_or_else(|| TxflowWsError::Client("zero WebSocket message rate".to_string()))?;
         let (handler, raw_rx) = channel_message_handler();
         let client = WebSocketClient::builder()
             .config(config)
             .message_handler(handler)
+            .default_quota(quota)
             .connect()
             .await
             .map_err(|e| TxflowWsError::Network(e.to_string()))?;
@@ -174,10 +192,15 @@ impl TxflowWebSocketClient {
 
     async fn send(&self, text: String) -> Result<(), TxflowWsError> {
         match &self.client {
-            Some(client) => Ok(client.send_text(text, None).await?),
+            Some(client) => send_paced(client, text).await,
             None => Ok(()),
         }
     }
+}
+
+/// Writes one frame, after the connection's outbound quota allows it.
+async fn send_paced(client: &WebSocketClient, text: String) -> Result<(), TxflowWsError> {
+    Ok(client.send_text(text, Some(&*SEND_KEYS)).await?)
 }
 
 fn frame(method: &str, subscription: &Value, top_level_type: bool) -> String {
@@ -195,9 +218,7 @@ async fn send_all(
 ) -> Result<(), TxflowWsError> {
     let wanted = subscriptions.lock().clone();
     for subscription in &wanted {
-        client
-            .send_text(frame("subscribe", subscription, top_level_type), None)
-            .await?;
+        send_paced(client, frame("subscribe", subscription, top_level_type)).await?;
     }
     Ok(())
 }
@@ -420,6 +441,58 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["subscription"]["type"], "bbo");
         client.disconnect().await;
+    }
+
+    /// A wide universe must not put every frame on the socket at once: 25 markets on one
+    /// channel is what the recorder subscribes, and `l2BookDepth`, `bbo` and `trades` each
+    /// cost one frame per market.
+    #[tokio::test]
+    async fn a_wide_subscribe_is_paced_rather_than_sent_at_once() {
+        const COINS: usize = 25;
+        const WINDOW_MS: u64 = 300;
+        // The quota starts full and then replenishes `WS_MESSAGES_PER_SEC` a second.
+        let allowed_in_window =
+            WS_MESSAGES_PER_SEC as usize + WS_MESSAGES_PER_SEC as usize * WINDOW_MS as usize / 1000;
+        assert!(allowed_in_window < COINS, "the test must be able to fail");
+
+        let (venue, url) = MockVenue::start().await;
+        let mut client = TxflowWebSocketClient::node(url);
+        let _rx = client.connect().await.unwrap();
+        let client = Arc::new(client);
+
+        // The data client spawns one task per subscription, so they race
+        let start = tokio::time::Instant::now();
+        let senders: Vec<_> = (0..COINS)
+            .map(|coin| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .subscribe(json!({"type": "trades", "coin": coin.to_string()}))
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(WINDOW_MS)).await;
+        let sent_in_window = venue.requests(1).len();
+        assert!(
+            sent_in_window <= allowed_in_window,
+            "{sent_in_window} frames in {WINDOW_MS} ms, quota allows {allowed_in_window}"
+        );
+
+        for sender in senders {
+            sender.await.unwrap();
+        }
+        wait_until("every subscribe", || venue.requests(1).len() == COINS).await;
+        // The frames over the burst wait one replenishment each
+        let expected_ms =
+            (COINS - WS_MESSAGES_PER_SEC as usize) as u64 * 1000 / u64::from(WS_MESSAGES_PER_SEC);
+        assert!(
+            start.elapsed() >= Duration::from_millis(expected_ms),
+            "{COINS} frames took {:?}, the quota needs at least {expected_ms} ms",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

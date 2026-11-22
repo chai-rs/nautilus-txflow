@@ -214,6 +214,9 @@ impl Feed {
         } else {
             json!({"type": channel, "coin": coin})
         };
+        // shortcut: the send waits for the frame quota while this lock is held, so a wide
+        // cold start delays `connect` and `close` by as long as it paces (about 7 s for 75
+        // frames); give the stream its own send task if that delay starts to matter.
         let ws = self.node.lock().await;
         if subscribe {
             ws.subscribe(subscription).await
